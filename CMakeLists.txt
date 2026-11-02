@@ -18,8 +18,6 @@ target_compile_options(project_warnings INTERFACE
     -Werror
 )
 
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
-include(ColdCodeImage)
-
 add_subdirectory(cold_code)
+include("${COLD_CODE_HELPER}")
 add_subdirectory(example)

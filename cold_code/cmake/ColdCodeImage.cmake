@@ -1,14 +1,5 @@
 include_guard(GLOBAL)
 
-find_package(Python3 COMPONENTS Interpreter REQUIRED)
-
-get_filename_component(COLD_CODE_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
-set(COLD_CODE_INCLUDE_DIR "${COLD_CODE_ROOT}/cold_code/include")
-set(COLD_CODE_IMAGE_LD "${COLD_CODE_ROOT}/cold_code/linker/cold_image.ld")
-set(COLD_CODE_RAM_LD "${COLD_CODE_ROOT}/cold_code/linker/cold_ram.ld")
-set(COLD_CODE_GENERATOR "${COLD_CODE_ROOT}/tool/gen_cold_code.py")
-set(COLD_CODE_VERIFY "${COLD_CODE_ROOT}/tool/verify_cold_ram.py")
-
 # cold_code_add_image(<executable-target>
 #                     SOURCES <cold sources...>
 #                     [SLOT_SIZE <bytes>]
@@ -18,6 +9,13 @@ set(COLD_CODE_VERIFY "${COLD_CODE_ROOT}/tool/verify_cold_ram.py")
 # Builds a flat cold image from the given sources (compiled with the cold-code
 # restrictions), generates hot stubs/manifest, adds them to the target, and
 # checks after linking that the slot pool landed in an RWX PT_LOAD.
+#
+# The helper is part of the cold_code library and locates its scripts/linker
+# files relative to its own location, so the library can be consumed with
+# add_subdirectory() without any knowledge of the consuming project.
+#
+# The consuming top-level project must enable ASM (generated stubs) and include
+# this file via the library-provided COLD_CODE_HELPER cache variable.
 #
 # Map outputs in OUTPUT_DIR:
 #   cold_image.map        - GNU ld map of the flat cold image
@@ -32,6 +30,20 @@ set(COLD_CODE_VERIFY "${COLD_CODE_ROOT}/tool/verify_cold_ram.py")
 # than one target in a directory needs a cold image, pass distinct OUTPUT_DIR
 # values (one cold image per executable in this version).
 function(cold_code_add_image target)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    if(NOT CMAKE_ASM_COMPILER_LOADED)
+        message(FATAL_ERROR
+            "cold_code_add_image requires the ASM language; add ASM to the "
+            "top-level project(... LANGUAGES ...) or call enable_language(ASM) there")
+    endif()
+
+    get_filename_component(cold_code_dir "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/.." ABSOLUTE)
+    set(include_dir "${cold_code_dir}/include")
+    set(image_ld "${cold_code_dir}/linker/cold_image.ld")
+    set(ram_ld "${cold_code_dir}/linker/cold_ram.ld")
+    set(generator "${cold_code_dir}/tool/gen_cold_code.py")
+    set(verifier "${cold_code_dir}/tool/verify_cold_ram.py")
+
     cmake_parse_arguments(ARG "" "SLOT_SIZE;POOL_SLOTS;OUTPUT_DIR" "SOURCES" ${ARGN})
 
     if(NOT ARG_SOURCES)
@@ -52,10 +64,9 @@ function(cold_code_add_image target)
 
     set(objects "${target}_cold_image_objects")
     add_library(${objects} STATIC ${ARG_SOURCES})
-    target_include_directories(${objects} PRIVATE "${COLD_CODE_INCLUDE_DIR}")
-    if(TARGET project_warnings)
-        target_link_libraries(${objects} PRIVATE project_warnings)
-    endif()
+    target_include_directories(${objects} PRIVATE "${include_dir}")
+    target_compile_features(${objects} PRIVATE c_std_17)
+    set_target_properties(${objects} PROPERTIES C_EXTENSIONS OFF)
     target_compile_options(${objects} PRIVATE
         -ffreestanding
         -fPIE
@@ -75,6 +86,15 @@ function(cold_code_add_image target)
         -g0
         -DCOLD_CODE_BUILD_IMAGE
     )
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(${objects} PRIVATE
+            -Wall
+            -Wextra
+            -Wpedantic
+            -Wshadow
+            -Werror
+        )
+    endif()
 
     file(MAKE_DIRECTORY "${ARG_OUTPUT_DIR}")
     set(elf "${ARG_OUTPUT_DIR}/cold_image.elf")
@@ -92,10 +112,10 @@ function(cold_code_add_image target)
         BYPRODUCTS "${cold_map}"
         COMMAND "${CMAKE_C_COMPILER}" -nostdlib -no-pie -Wl,-e,0
                 -Wl,--whole-archive "$<TARGET_FILE:${objects}>" -Wl,--no-whole-archive
-                "-Wl,-T,${COLD_CODE_IMAGE_LD}" -Wl,--emit-relocs
+                "-Wl,-T,${image_ld}" -Wl,--emit-relocs
                 -Wl,--build-id=none "-Wl,-Map,${cold_map}"
                 -o "${elf}"
-        DEPENDS ${objects} "$<TARGET_FILE:${objects}>" "${COLD_CODE_IMAGE_LD}"
+        DEPENDS ${objects} "$<TARGET_FILE:${objects}>" "${image_ld}"
         COMMENT "Linking cold code image"
         VERBATIM
     )
@@ -111,7 +131,7 @@ function(cold_code_add_image target)
     add_custom_command(
         OUTPUT "${final_bin}" "${gen_header}" "${gen_source}" "${gen_stubs}"
                "${layout_map}"
-        COMMAND "${Python3_EXECUTABLE}" "${COLD_CODE_GENERATOR}"
+        COMMAND "${Python3_EXECUTABLE}" "${generator}"
                 --nm "${CMAKE_NM}"
                 --readelf "${CMAKE_READELF}"
                 --objdump "${CMAKE_OBJDUMP}"
@@ -125,7 +145,7 @@ function(cold_code_add_image target)
                 --stubs "${gen_stubs}"
                 --layout-map "${layout_map}"
                 --image-path "${final_bin}"
-        DEPENDS "${elf}" "${raw_bin}" "${COLD_CODE_GENERATOR}"
+        DEPENDS "${elf}" "${raw_bin}" "${generator}"
         COMMENT "Generating cold code stubs and manifest"
         VERBATIM
     )
@@ -138,14 +158,15 @@ function(cold_code_add_image target)
     add_dependencies(${target} "${target}_cold_image_gen")
 
     target_link_options(${target} PRIVATE
-        "-Wl,-T,${COLD_CODE_RAM_LD}"
+        "-Wl,-T,${ram_ld}"
         "-Wl,--no-warn-rwx-segments"
         "-Wl,-Map,${hot_map}"
     )
+    set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${ram_ld}")
     set_property(DIRECTORY APPEND PROPERTY ADDITIONAL_CLEAN_FILES "${hot_map}")
 
     add_custom_command(TARGET ${target} POST_BUILD
-        COMMAND "${Python3_EXECUTABLE}" "${COLD_CODE_VERIFY}"
+        COMMAND "${Python3_EXECUTABLE}" "${verifier}"
                 --readelf "${CMAKE_READELF}"
                 --elf "$<TARGET_FILE:${target}>"
                 --symbol cold_code_slot_pool

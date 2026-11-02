@@ -29,24 +29,25 @@ int result = cold_code_add(2, 3);
 ```text
 .
 ├── CMakeLists.txt
-├── cmake/
-│   └── ColdCodeImage.cmake        # cold_code_add_image() 构建封装
-├── cold_code/
+├── cold_code/                     # 自包含冷代码库
+│   ├── CMakeLists.txt
+│   ├── cmake/ColdCodeImage.cmake  # cold_code_add_image() 构建封装
 │   ├── include/cold_code.h        # 公共 API / COLD_CODE()
 │   ├── linker/cold_image.ld       # 冷镜像链接脚本（VMA 0，仅 .cold_text）
 │   ├── linker/cold_ram.ld         # 热端 .cold_ram 段放置片段
 │   ├── src/cold_code.c            # loader 核心 + slot 级 LRU（无 OS 接口）
 │   ├── src/cold_code_port.h       # port 接口（内部）
-│   └── src/cold_code_port_host.c  # 宿主 port：文件读取模拟 flash
+│   ├── src/cold_code_port_host.c  # 宿主 port：文件读取模拟 flash
+│   ├── tool/gen_cold_code.py      # 符号解析 / 校验 / stub 生成
+│   └── tool/verify_cold_ram.py    # 链接后 RWX 段检查
 ├── example/
 │   ├── CMakeLists.txt
 │   ├── cold/cold_functions.c      # COLD_CODE() 冷函数
 │   ├── cold/cold_functions.h
 │   └── main.c
-├── tool/
-│   ├── gen_cold_code.py           # 符号解析 / 校验 / stub 生成
+├── tool/                          # 通用模板工具
 │   ├── init.py                    # 模板初始化 / .vscode 生成
-│   └── verify_cold_ram.py         # 链接后 RWX 段检查
+│   └── vscode/
 ├── .clang-format
 └── .gitignore
 ```
@@ -93,7 +94,7 @@ loaded final: 1/1 (image slots: 3)
 
 1. 冷源文件用一组受限选项编译（`-fPIE -fvisibility=hidden -ffreestanding -fno-jump-tables -fno-stack-protector -fno-builtin -O1 ...`；`-O1` 默认关闭 IPA-ICF）。
 2. 冷对象链接成基址 0 的 `cold_image.elf`，链接脚本只保留 `.cold_text`；引用 libc/静态数据/字符串会直接链接失败。
-3. `objcopy -O binary` 得到 raw image；`tool/gen_cold_code.py` 解析 `nm`/`readelf`/`objdump`，校验后补齐到 slot 整数倍，并生成：
+3. `objcopy -O binary` 得到 raw image；`cold_code/tool/gen_cold_code.py` 解析 `nm`/`readelf`/`objdump`，校验后补齐到 slot 整数倍，并生成：
    - `cold_code_stubs.S`：每个全局冷函数一个热端 stub（携带镜像 slot 号 + slot 内偏移），并定义 `.cold_ram` 池；
    - `cold_code_image.c/.h`：descriptor（`slot_size` / `slot_count` / `pool_slot_count`）与镜像路径宏；**没有函数表和函数 ID**。
 4. 热端链接时用 `cold_ram.ld` 把生成的 `.cold_ram`（`"awx",@nobits`）放进独立的 RWX `PT_LOAD`；POST_BUILD 用 `verify_cold_ram.py` 检查该段确实可写可执行。
@@ -177,6 +178,32 @@ if (!cold_code_init(&cold_code_image, COLD_CODE_IMAGE_PATH)) {
 cold_code_set_trace(true);
 int r = cold_code_add(2, 3);
 ```
+
+### 作为独立库使用
+
+`cold_code/` 是一个自包含模块，其他工程可直接 `add_subdirectory` 后复用（顶层必须启用 ASM；Python3 只在调用 `cold_code_add_image()` 时需要）：
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(app LANGUAGES C ASM)
+
+add_subdirectory(path/to/cold_code cold_code)
+include("${COLD_CODE_HELPER}")   # 库导出的 helper 路径
+
+add_executable(app main.c)
+target_link_libraries(app PRIVATE cold_code)
+cold_code_add_image(app
+    SOURCES cold/app_cold.c
+    SLOT_SIZE 64
+    POOL_SLOTS 1
+)
+```
+
+- `cold_code` 自带 C17/严格 warning 设置，不依赖宿主的 `project_warnings`。
+- `COLD_CODE_HELPER` 由库的 `CMakeLists.txt` 设置；在顶层 include 后，示例/子目录都可调用 `cold_code_add_image()`。
+- 顶层缺少 ASM 时，调用 `cold_code_add_image()` 会给出明确错误。
+- 本版本不提供 `install()`/`find_package()`；请使用源码 `add_subdirectory`。
+- `tool/init.py --module` 的模板重命名仍是旧逻辑，不适用于当前库结构；`--project` 不受影响。
 
 ### 公共 API
 
