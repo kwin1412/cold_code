@@ -1,0 +1,17 @@
+{
+    "clangd.arguments": [
+        "--compile-commands-dir=${workspaceFolder}/build",
+        "--clang-tidy",
+        "--header-insertion=never",
+        "--query-driver=/usr/bin/cc,/usr/bin/gcc,/usr/bin/clang"
+    ],
+    "C_Cpp.intelliSenseEngine": "disabled",
+    "cmake.buildDirectory": "${workspaceFolder}/build",
+    "cmake.configureOnOpen": true,
+    "files.associations": {
+        "*.h": "c"
+    },
+    "[c]": {
+        "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd"
+    }
+}

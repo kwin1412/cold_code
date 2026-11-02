@@ -1,0 +1,15 @@
+---
+# 基于 LLVM 风格：4 空格缩进、100 列、左花括号不换行
+Language: Cpp
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+PointerAlignment: Right
+AlignConsecutiveMacros: true
+SpaceAfterCStyleCast: false

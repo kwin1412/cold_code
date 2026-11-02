@@ -1,0 +1,50 @@
+# Build directories
+build/
+build-*/
+cmake-build-*/
+out/
+
+# CMake artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+CMakeUserPresets.json
+
+# Object files and libraries
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# Executable files
+*.out
+
+# Coverage and profiling artifacts
+*.gcda
+*.gcno
+*.gcov
+gmon.out
+
+# Editor / IDE
+.vscode/
+.idea/
+.cache/
+.clangd/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store
+
+# Core dumps
+core
+core.*
