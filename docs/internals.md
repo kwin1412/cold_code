@@ -1,5 +1,7 @@
 # cold_code v3 internals
 
+> 完整架构、设计权衡与路线图见 [技术报告](technical-report.md)。
+
 ## 分层
 
 ```text
@@ -16,8 +18,8 @@ generated stubs (x86-64)
   fast: accessor -> fast-state checks/LRU update -> jump
 ```
 
-core 不包含 port/source 实现，也不读取 thread/core id。fast-state 块是唯一固定布局的
-manager 前缀；其余 manager 字段对消费者不可见。
+core 不包含 port 实现，也不读取 thread/core id；它提供平台无关的 memory source
+实现。fast-state 块是唯一固定布局的 manager 前缀；其余 manager 字段对消费者不可见。
 
 ## Manager 实现
 
@@ -105,7 +107,7 @@ typedef struct {
 
 ## Slow stub ABI
 
-- 保存 `rax/AL, rdi, rsi, rdx, rcx, r8, r9, xmm0-7`，栈参数不动。
+- 保存完整 `%rax`（含 AL）、`rdi/rsi/rdx/rcx/r8/r9` 和 `xmm0-7`，栈参数不动。
 - `leaq cold_code_image_<name>(%rip), %rdi`；`mov $slot, %esi`；
   `call cold_code_core_acquire_slot_v1`；恢复参数；`add $intra, %r11`；`jmp *%r11`。
 - 入口 `endbr64`；冷函数由 `-fcf-protection=branch` 生成 `endbr64`。

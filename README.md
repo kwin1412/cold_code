@@ -14,6 +14,9 @@ int result = cold_code_add(2, 3);
 热端没有冷函数体，只有构建期生成的同名 x86-64 stub。核心 loader 不依赖 `dlopen`、
 按需分页、`SIGSEGV` 或 `userfaultfd`。
 
+> 深入架构、设计原理、权衡、测试/性能证据与未来路线图见
+> [技术报告](docs/technical-report.md)。
+
 ## v3 主要变化
 
 - **不透明 manager**：`cold_code_manager_t` 只暴露固定大小的字节区，内部布局隐藏；
@@ -71,6 +74,25 @@ arch backend             x86_64 slow/fast stub、relocation/call 校验、ABI of
 - 每 manager 统计与 trace：load/evict、hits/misses、faults。
 - install/export/find_package；helper 自动启用 ASM。
 
+## 优点与代价
+
+- **优点**：调用点透明、常驻空间可控、无 OS loader 依赖；slot 级真 LRU、多 manager/
+  多 image、执行上下文隔离；core/port/arch 分层清晰，host/baremetal port 可复用；
+  构建期拒绝跨 slot/未定义符号/非法重定位，运行时提供 trace/stats/fault；
+  install/export/find_package 降低接入成本。
+- **代价**：当前只有 x86-64 有 stub/FAST；host 依赖静态 RWX 段；冷函数须单 slot、
+  自包含且禁止跨 slot 直调；无 pin/无锁，一个 manager 仅限一个执行上下文；
+  baremetal 目前只支持 slow stub。
+- 完整权衡、量化证据与适用边界见[技术报告](docs/technical-report.md)。
+
+## 文档导航
+
+- [技术报告](docs/technical-report.md)：架构、原理、设计权衡、优缺点、测试/性能证据、
+  未来路线图。
+- [internals](docs/internals.md)：manager/storage/fast-state/stub/fault 实现细节。
+- [porting](docs/porting.md)：context port、source、storage 与 linker 移植契约。
+- [migration-v2-v3](docs/migration-v2-v3.md)：v2 → v3 API 与构建迁移。
+
 ## 目录
 
 ```text
@@ -93,7 +115,7 @@ cold_code/
 example/                                # 最小消费者，复用 cold_code::host
 tests/                                  # CTest + fixtures + benchmark
 tool/                                   # init.py / vscode 模板
-docs/                                   # porting / internals / migration
+docs/                                   # internals / porting / migration / technical-report
 ```
 
 ## 构建与测试
@@ -219,14 +241,17 @@ cold_code_add_image(app NAME app SOURCES cold/app_cold.c SLOT_SIZE 64 POOL_SLOTS
 | `cold_code_manager_activate(mgr)` | 选择当前执行上下文的 manager；`NULL` 清除 |
 | `cold_code_manager_current()` | 当前 manager 或 `NULL` |
 | `cold_code_manager_stats(mgr, out)` | image/pool/loaded/loads/evictions/hits/misses/faults |
+| `cold_code_manager_is_initialized(mgr)` | manager 是否已初始化 |
 | `cold_code_manager_image/pool_base/pool_slots` | 只读 introspection |
 | `cold_code_source_t` | `{ops, ctx}`；`open`/`read` 必需，`close` 可选 |
 | `cold_code_memory_source_init/handle` | core 提供的 memory/flash source |
-| `cold_code_context_ops` | context port vtable（current/set_current/fatal/sync_code） |
+| `cold_code_context_ops` | context port vtable（abi_version/struct_size/arch/current/set_current/fatal/sync_code） |
 | `cold_code_fault_info_t` | 结构化 fault（code/manager/image/slot/message） |
 | `cold_code_storage_required_size/align` | storage 尺寸/对齐计算 |
 | `COLD_CODE_STORAGE_SIZE(...)` | 编译期 storage 大小宏（core 与生成头共用） |
 | `COLD_CODE_DEFINE_STORAGE(name, var)` | 声明 storage + RWX marker |
+| `cold_code_crc32(data, size)` | IEEE CRC32（与生成器 zlib.crc32 一致） |
+| `cold_code_image_header_encode/decode` | v3 wire header 编码/校验解码 |
 | `cold_code_status_string(status)` | 状态文本 |
 
 ### 状态码
@@ -235,7 +260,9 @@ cold_code_add_image(app NAME app SOURCES cold/app_cold.c SLOT_SIZE 64 POOL_SLOTS
 `ERR_ARCH`、`ERR_UNSUPPORTED`。
 
 运行时 loader fault（无 current、image 指针不符、slot 非法、状态损坏、source read
-失败）调用 manager 的 fault callback，然后调用 context port 的 `fatal`；`fatal` 不得返回。
+失败、无 LRU victim、context port 不可用）调用 manager 的 fault callback，然后调用
+context port 的 `fatal`；`fatal` 不得返回。无 current manager 时没有 manager 可回调，
+直接走 port fatal。
 
 ## Image v3 格式
 
@@ -265,7 +292,7 @@ core 用逐字节 LE 解码，不 overlay native struct；header CRC 和 payload
 ## Storage 布局
 
 ```text
-storage header (owner/magic/ABI/image/slot/pool/total)
+storage header (owner/magic/ABI/struct_size/image/slot/pool/total)
 aligned pool[pool_slots][slot_size]        <- executable
 slot_map[slot_count]                       <- way + 1, 0 = not resident
 way_slot[pool_slots]                       <- image slot / UINT32_MAX
@@ -274,7 +301,8 @@ way_used[pool_slots]                       <- LRU tick
 
 `COLD_CODE_STORAGE_SIZE(slot_count, pool_slots, slot_size, align)` 是唯一事实来源；
 生成的 storage 类型按 `image->max_pool_slots` 大小声明。init 校验实际
-`storage_size`、地址对齐、storage header magic/ABI/owner。
+`storage_size`、地址对齐、storage header magic/ABI/struct_size/owner；image_id/
+slot_count/pool_slots/total_size 由 core 在 claim 时写入，作为运行期元数据。
 
 ## 运行期模型
 
@@ -320,7 +348,8 @@ unsigned cold_code_baremetal_cpu_id(void);  /* weak，默认 0 */
 - per-core `managers[COLD_CODE_BAREMETAL_MAX_CORES]`，通过 `cpu_id()` 索引。
 - 无 libc/malloc/stdio；默认 fatal 为 `__builtin_trap()`。
 - `sync_code` 用于 D-cache clean + I-cache invalidate；在 slot 读入后、标记 resident 前调用。
-- 本期使用 slow stub；FAST_PATH 的 arch accessor 通过 arch 插件后续扩展。
+- 本期使用 slow stub；x86-64 arch 插件已声明 fast 支持/accessor，缺的是 baremetal
+  port 自己的 fast accessor 实现。
 - host 上用线程模拟 core 的测试见 `tests/test_baremetal_v3.c`。
 
 ### 自定义 port
@@ -342,13 +371,15 @@ cold_code_add_image(<executable>
 )
 ```
 
-- `POOL_SLOTS` 是生成 storage 容量上限；运行期 `config.pool_slots` 可选更小值
-  （0 使用上限）。
+- `POOL_SLOTS` 是生成 storage 容量上限，硬上限 16，生成器实际取
+  `min(POOL_SLOTS, slot_count)`；运行期 `config.pool_slots` 可选更小值（0 使用上限）。
 - `SLOT_SIZE` 必须是 arch 池对齐（x86-64 为 64）的整数倍。
 - helper 自动启用 ASM，校验未知参数、target 类型、arch backend、工具存在性。
-- `RAM_SECTION ON`（host 默认）应用 `.cold_ram` linker 片段；`VERIFY_RWX` 默认跟随。
+- `RAM_SECTION ON` 默认对所有 arch 开启，应用 `.cold_ram` linker 片段；baremetal
+  交叉构建可关闭。`VERIFY_RWX` 默认跟随 `RAM_SECTION`。
 - `DEFINE_PATH ON` 定义 build-tree 绝对路径便利宏；默认不定义。
-- 生成文件位于 `OUTPUT_DIR`（默认 `<binary>/cold_code_<target>_<name>/`）：
+- 生成文件位于 `OUTPUT_DIR`（默认 `CMAKE_CURRENT_BINARY_DIR` 下的
+  `cold_code_<target>_<name>/`，可能是 `build/tests` 等子目录）：
   `cold_code_<name>.bin`、`_image.h/.c`、`_stubs.S`、`_layout.map`、`_symbols.txt`。
 
 ## 冷函数约束
@@ -387,15 +418,19 @@ ctest --test-dir build -R 'lru|multi|baremetal|install|reject' -V
 ./build/tests/bench_slow
 ```
 
-本机 Debug 参考（WSL2 x86-64，GCC 13）：
+本机参考（WSL2 x86-64 / GCC 13.3.0 / CMake 3.28.3 / i5-13600K / Debug，
+benchmark TU `-O2`；各运行 3 次取中位数后取整）：
 
-| 路径 | 结果 |
+| 路径 | 参考值 |
 |---|---|
 | fast hit | ≈ 4.2 ns/call |
-| slow hit | ≈ 12.3 ns/call |
-| miss/换入 | ≈ 222 ns/call |
+| slow hit | ≈ 12.1 ns/call |
+| fast miss | ≈ 215 ns/call |
+| slow miss | ≈ 231 ns/call |
 
-FAST_PATH 只优化命中；miss 仍走 C loader + source read。
+fast 命中约为 slow 的 2.9 倍。FAST_PATH 只优化命中；miss 仍走 C loader + source
+read。数字随编译器、构建类型和机器波动，不作为 SLA；完整环境、采样范围与复现命令
+见[技术报告](docs/technical-report.md)。
 
 ## v2 → v3 迁移
 
@@ -420,7 +455,7 @@ FAST_PATH 只优化命中；miss 仍走 C loader + source read。
 
 - stub/FAST_PATH 只实现 x86-64；ARM/RISC-V 只有 arch 插件接口。
 - host fast accessor 依赖 local-exec TLS，只适合静态链接 host。
-- 冷水池依赖静态 RWX 段；W^X/MPU 环境需替换 linker/port 方案。
+- 冷代码池依赖静态 RWX 段；W^X/MPU 环境需替换 linker/port 方案。
 - 每函数单 slot、禁止跨 slot 直调、自包含约束未改变。
 - 无 pin；冷函数执行期间通过热端回调重入其他 slot 不安全。
 - 一个 manager 只能由一个执行上下文使用；库不加锁。
@@ -430,6 +465,21 @@ FAST_PATH 只优化命中；miss 仍走 C loader + source read。
 - image CRC 只检测损坏，不是签名/认证；不可信 image 等于任意代码执行。
 - 生成器依赖 nm/readelf/objdump 文本输出；未做机器可读 ELF 解析。
 - `tool/init.py` 不再支持 `--module` 重命名（v3 目录不是传统模板结构）。
+
+## 未来路线图
+
+> 路线图不是交付承诺；状态、验收标准与风险见[技术报告](docs/technical-report.md)。
+
+- **阶段 0（v3.x 稳定化，计划中）**：冻结 ABI/image v3，建立 CI/benchmark/文档一致性
+  基线。
+- **阶段 1（可移植性，计划中）**：ARMv7-M/AArch64/RISC-V slow backend、reloc/调用
+  校验、linker 与 QEMU smoke。
+- **阶段 2（内存保护与安全，探索中）**：W^X/MPU、可选 pin/refcount、image 签名/
+  认证接入。
+- **阶段 3（工具链与可复现性，探索中）**：机器可读 ELF、确定性 slot 分配/packer、
+  自动原型与语言绑定。
+- **阶段 4（运行时能力，探索中）**：后台预取/DMA、多 task manager、可配置淘汰策略、
+  统计导出。
 
 ## 格式化
 

@@ -1,5 +1,7 @@
 # v2 → v3 migration
 
+> 完整架构、设计权衡与路线图见 [技术报告](technical-report.md)。
+
 v3 是 breaking redesign，不提供 v2 兼容层。仓库内 example/tests/consumer 已全部迁移。
 
 ## API 映射
@@ -13,7 +15,7 @@ v3 是 breaking redesign，不提供 v2 兼容层。仓库内 example/tests/cons
 | `cold_code_manager_deinit/reset/stats`（void/status 混合） | 全部返回 `cold_code_status_t` |
 | 直接读 `mgr->pool/image/pool_slots` | `cold_code_manager_pool_base/image/pool_slots` |
 | `cold_code_port_set_current/current/fatal/abort` | `cold_code_context_ops` vtable |
-| `cold_code_port_current_fast` | 同名 x86-64 私有 accessor（host port 提供） |
+| `cold_code_port_current_fast` | `cold_code_context_current_fast`（host port 提供） |
 | `cold_code_storage_<n>_t` 可见字段 | 不透明字节 storage 类型 |
 | 36 字节 native-endian image v2 | 64 字节小端 image v3 + header CRC |
 | `POOL_SLOTS` 固定在 image | 生成上限 + 每 manager `config.pool_slots` |
@@ -24,7 +26,8 @@ v3 是 breaking redesign，不提供 v2 兼容层。仓库内 example/tests/cons
 
 ## 行为变化
 
-- storage 由 core 切分并校验 magic/ABI/image/slot/pool/owner；`bind()` 删除。
+- storage 由 core 切分并校验 magic/ABI/struct_size/owner；image_id/slot_count/
+  pool_slots/total_size 由 core 在 claim 时写入；`bind()` 删除。
 - `activate` 对未初始化 manager 返回 `ERR_STATE`；只有“调用冷函数时无 current”
   仍 fatal。
 - `manager_stats`/`reset`/`deinit` 对未初始化 manager 返回 `ERR_STATE`。

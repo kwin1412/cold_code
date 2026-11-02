@@ -1,5 +1,7 @@
 # Porting cold_code v3
 
+> 完整架构、设计权衡与路线图见 [技术报告](technical-report.md)。
+
 `cold_code::core` 只依赖一个 context port 和调用方提供的 storage/source。一个
 executable 恰好链接一个 context port；库自带 host 与 baremetal 参考实现。
 
@@ -40,7 +42,8 @@ extern const cold_code_context_ops_t cold_code_context_ops;
 - x86-64 fast accessor `cold_code_context_current_fast`：私有 ABI，manager 在 `%r11`，
   preserve 参数寄存器，不碰栈/SSE。使用 local-exec TLS，仅静态链接 host。
 - fatal 打印后 `abort()`；`sync_code = NULL`。
-- 编译 fast accessor TU 时加 `-ftls-model=local-exec`（host target 已处理）。
+- TLS 变量的 C TU 以 `-ftls-model=local-exec` 编译（host target 已处理）；fast
+  accessor 是手写汇编，直接用 `@tpoff` 访问该 TLS 变量。
 
 ## Baremetal port
 
@@ -59,7 +62,8 @@ cold_code_baremetal_init(&cfg);
 
 - `cold_code_baremetal_cpu_id()` 是 weak 符号，默认 0；多核目标提供强定义
   （读 MPIDR/COREID 等）。
-- `current/set_current` 用 `managers[cpu_id]`；cpu id 越界会 fatal/trap。
+- `current/set_current` 用 `managers[cpu_id]`；`current()` 遇到越界 cpu id 返回
+  `NULL`（随后表现为 loader 的 `NO_CURRENT` fault），`set_current()` 越界才 trap。
 - 无 libc/malloc/stdio；默认 fatal 为 `__builtin_trap()`。
 - `sync_code` 应完成平台所需的 cache 维护；无 cache 的核可留空。
 - 本期只使用 slow stub；FAST_PATH 需要对应 arch 的 fast accessor。

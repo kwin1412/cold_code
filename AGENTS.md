@@ -1,7 +1,8 @@
 # AGENTS.md
 
-本文件面向在本仓库中工作的编码 agent。设计细节以 `README.md` 和 `docs/` 为准；
-这里只列必须知道的约定、命令和约束。
+本文件面向在本仓库中工作的编码 agent。设计细节以 `README.md`、
+`docs/technical-report.md`、`docs/internals.md`、`docs/porting.md` 和
+`docs/migration-v2-v3.md` 为准；这里只列必须知道的约定、命令和约束。
 
 ## 项目概述
 
@@ -19,6 +20,22 @@
   无共享可变状态、无锁、无 pin。同一 manager 只能由一个执行上下文使用。
 - 核心 loader 不调用 OS 动态加载接口（无 `dlopen`、按需分页、`SIGSEGV`、
   `userfaultfd`）；host port 只用文件/内存读取模拟 flash。
+
+## 文档维护
+
+- 单一事实来源矩阵：
+  - `README.md`：快速开始、公共 API 速查、命令、迁移摘要；
+  - `docs/internals.md`：manager/storage/fast-state/stub/fault 实现细节；
+  - `docs/porting.md`：context port/source/storage/linker 移植契约；
+  - `docs/migration-v2-v3.md`：v2 → v3 API/构建迁移；
+  - `docs/technical-report.md`：架构原理、设计权衡、优缺点、测试/性能证据、路线图。
+- 修改公共 API、ABI、image v3 格式、storage 布局、CMake helper、port 契约、硬性
+  约束、测试数量或 benchmark 时，同一变更内同步更新 README、AGENTS.md 和
+  `docs/technical-report.md`；仅措辞/链接修正可只改相关文件。
+- 精确性能数字与采样范围只写入技术报告的「证据块」（提交、日期、CPU、编译器、
+  构建类型、命令、采样方法）；README 仅保留取整参考值并链接报告，不复制未复测数字。
+- 路线图条目必须标注状态（计划中/进行中/探索中/不在范围），不得写成已交付承诺。
+- 新增/移动文档时同步更新 README「文档导航」和本文件「目录」「关键文件」。
 
 ## 快速命令
 
@@ -57,7 +74,7 @@ cold_code/
 example/                               最小消费者，链接 cold_code::host
 tests/                                 CTest、负向 fixture、consumer、benchmark
 tool/                                  init.py / vscode 模板
-docs/                                  porting / internals / migration
+docs/                                  internals / porting / migration-v2-v3 / technical-report
 ```
 
 ## 硬性约束
@@ -211,6 +228,9 @@ cold_code_add_image(app
 - `cold_code/cmake/cold_code-config.cmake.in`：install/find_package。
 - `tests/CMakeLists.txt`：CTest/fixtures/benchmark。
 - `example/main.c`：最小消费者。
+- `docs/technical-report.md`：架构、原理、权衡、优缺点、测试/性能证据与路线图
+  （深度说明的权威来源）。
+- `docs/internals.md`、`docs/porting.md`、`docs/migration-v2-v3.md`：实现/移植/迁移细节。
 
 ## 验证清单
 
@@ -223,3 +243,8 @@ cold_code_add_image(app
 7. `cmake -S . -B build-notest -DBUILD_TESTING=OFF` 可构建；
    `-DCOLD_CODE_BUILD_EXAMPLE=OFF` 可跳过 example。
 8. 安装到临时 prefix 后，`find_package(cold_code 3 CONFIG)` consumer 可构建运行。
+9. 文档变更：`git diff --check` 通过；Markdown 代码围栏成对；README/AGENTS/report
+   的相对链接均可解析；三处测试数量、限制、benchmark 范围与 roadmap 状态一致。
+10. 若更新性能数字或 API/ABI 结论：重新构建并跑 26/26 CTest，重跑
+    `bench_fast`/`bench_slow`（建议 3 次取中位数），把提交/日期/环境写入报告证据块
+    后再更新 README。
