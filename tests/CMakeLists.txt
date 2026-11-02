@@ -8,10 +8,12 @@ find_package(Threads REQUIRED)
 add_library(test_host_port STATIC
     support/port_host.c
     support/port_host.h
+    support/port_host_fast_x86_64.S
 )
 target_link_libraries(test_host_port PUBLIC cold_code_port_interface)
-target_link_libraries(test_host_port PRIVATE project_warnings)
+target_link_libraries(test_host_port PRIVATE cold_code_fast_x86_64 project_warnings)
 target_include_directories(test_host_port PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/support")
+target_compile_options(test_host_port PRIVATE -ftls-model=local-exec)
 target_compile_features(test_host_port PRIVATE c_std_17)
 set_target_properties(test_host_port PROPERTIES C_EXTENSIONS OFF)
 
@@ -33,6 +35,7 @@ cold_code_add_image(test_init
     SOURCES cold/init_cold.c
     SLOT_SIZE 64
     POOL_SLOTS 1
+    FAST_PATH ON
     OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/init_image"
 )
 add_test(NAME cold_code.init COMMAND test_init)
@@ -45,6 +48,7 @@ cold_code_add_image(test_lru_1way
     SOURCES cold/lru_cold.c
     SLOT_SIZE 64
     POOL_SLOTS 1
+    FAST_PATH ON
     OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/lru1_image"
 )
 add_test(NAME cold_code.lru_1way COMMAND test_lru_1way)
@@ -61,6 +65,7 @@ cold_code_add_image(test_lru_2way
     SOURCES cold/lru_cold.c
     SLOT_SIZE 64
     POOL_SLOTS 2
+    FAST_PATH ON
     OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/lru2_image"
 )
 add_test(NAME cold_code.lru_2way COMMAND test_lru_2way)
@@ -77,6 +82,7 @@ cold_code_add_image(test_abi
     SOURCES cold/abi_cold.c
     SLOT_SIZE 512
     POOL_SLOTS 1
+    FAST_PATH ON
     OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/abi_image"
 )
 add_test(NAME cold_code.abi COMMAND test_abi)
@@ -88,6 +94,7 @@ cold_code_add_image(test_preinit
     SOURCES cold/preinit_cold.c
     SLOT_SIZE 64
     POOL_SLOTS 1
+    FAST_PATH ON
     OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/preinit_image"
 )
 add_test(NAME cold_code.preinit_abort
@@ -105,6 +112,7 @@ cold_code_add_image(test_image_format
     SOURCES cold/imagefmt_cold.c
     SLOT_SIZE 64
     POOL_SLOTS 1
+    FAST_PATH ON
     OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/imagefmt_image"
 )
 add_test(NAME cold_code.image_format COMMAND test_image_format)
@@ -121,6 +129,7 @@ cold_code_add_image(test_multi_manager
     SOURCES cold/multi_cold.c
     SLOT_SIZE 64
     POOL_SLOTS 1
+    FAST_PATH ON
     OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/multi_image"
 )
 add_test(NAME cold_code.multi_manager COMMAND test_multi_manager)
@@ -139,6 +148,7 @@ cold_code_add_image(test_same_image_two_slots
     SOURCES cold/slots_cold.c
     SLOT_SIZE 64
     POOL_SLOTS 1
+    FAST_PATH ON
     OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/slots_image"
 )
 add_test(NAME cold_code.same_image_two_slots COMMAND test_same_image_two_slots)
@@ -146,17 +156,19 @@ add_test(NAME cold_code.same_image_two_slots COMMAND test_same_image_two_slots)
 # Links only cold_code_core and provides its own per-CPU port + memory source.
 # It must NOT link test_host_port or any other host port: this is the
 # interface-isolation proof and the custom-port example.
-add_executable(test_custom_port test_custom_port.c)
+add_executable(test_custom_port test_custom_port.c test_custom_port_fast_x86_64.S)
 target_link_libraries(test_custom_port PRIVATE
     cold_code_core
     project_warnings
     Threads::Threads
 )
+target_compile_options(test_custom_port PRIVATE -ftls-model=local-exec)
 cold_code_add_image(test_custom_port
     NAME custom
     SOURCES cold/slots_cold.c
     SLOT_SIZE 64
     POOL_SLOTS 1
+    FAST_PATH ON
     OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/custom_image"
 )
 add_test(NAME cold_code.custom_port COMMAND test_custom_port)
@@ -169,6 +181,7 @@ cold_code_add_image(test_multi_image
     SOURCES cold/first_cold.c
     SLOT_SIZE 64
     POOL_SLOTS 1
+    FAST_PATH ON
     OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/first_image"
 )
 cold_code_add_image(test_multi_image
@@ -176,6 +189,7 @@ cold_code_add_image(test_multi_image
     SOURCES cold/second_cold.c
     SLOT_SIZE 64
     POOL_SLOTS 1
+    FAST_PATH ON
     OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/second_image"
 )
 add_test(NAME cold_code.multi_image COMMAND test_multi_image)
@@ -189,6 +203,7 @@ cold_code_add_image(test_image_mismatch
     SOURCES cold/first_cold.c
     SLOT_SIZE 64
     POOL_SLOTS 1
+    FAST_PATH ON
     OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/mismatch_first_image"
 )
 cold_code_add_image(test_image_mismatch
@@ -196,6 +211,7 @@ cold_code_add_image(test_image_mismatch
     SOURCES cold/second_cold.c
     SLOT_SIZE 64
     POOL_SLOTS 1
+    FAST_PATH ON
     OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/mismatch_second_image"
 )
 add_test(NAME cold_code.image_mismatch
@@ -276,3 +292,30 @@ add_test(NAME cold_code.external_consumer
             -P "${CMAKE_CURRENT_SOURCE_DIR}/run_consumer.cmake"
 )
 set_tests_properties(cold_code.external_consumer PROPERTIES TIMEOUT 120)
+
+# Call-path benchmarks (built with the test host port; not registered as CTest).
+add_executable(bench_fast bench_cold_call.c)
+target_compile_definitions(bench_fast PRIVATE BENCH_FAST=1)
+target_compile_options(bench_fast PRIVATE -O2)
+target_link_libraries(bench_fast PRIVATE cold_code_core test_host_port project_warnings)
+cold_code_add_image(bench_fast
+    NAME bench_fast
+    SOURCES cold/lru_cold.c
+    SLOT_SIZE 64
+    POOL_SLOTS 1
+    FAST_PATH ON
+    OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/bench_fast_image"
+)
+
+add_executable(bench_slow bench_cold_call.c)
+target_compile_definitions(bench_slow PRIVATE BENCH_FAST=0)
+target_compile_options(bench_slow PRIVATE -O2)
+target_link_libraries(bench_slow PRIVATE cold_code_core test_host_port project_warnings)
+cold_code_add_image(bench_slow
+    NAME bench_slow
+    SOURCES cold/lru_cold.c
+    SLOT_SIZE 64
+    POOL_SLOTS 1
+    FAST_PATH OFF
+    OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/bench_slow_image"
+)

@@ -1,5 +1,6 @@
 #include "port_host.h"
 #include "cold_code_port.h"
+#include "cold_code_port_fast.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,15 +10,20 @@
  * The host port keeps the current manager per thread.  Managers never share
  * mutable state, so concurrent threads using different managers need no
  * locking.  Using one manager from two threads at once is a caller error.
+ *
+ * The variable is hidden but non-static so the tiny FAST_PATH assembly
+ * accessor can load it with a local-exec TLS access.  This port is intended
+ * for STATIC executables (Phase 2).
  */
-static _Thread_local cold_code_manager_t *g_current_manager;
+_Thread_local cold_code_manager_t *cold_code_port_current_manager
+    __attribute__((visibility("hidden")));
 
 void cold_code_port_set_current(cold_code_manager_t *mgr) {
-    g_current_manager = mgr;
+    cold_code_port_current_manager = mgr;
 }
 
 cold_code_manager_t *cold_code_port_current(void) {
-    return g_current_manager;
+    return cold_code_port_current_manager;
 }
 
 _Noreturn void cold_code_port_fatal(const char *message) {

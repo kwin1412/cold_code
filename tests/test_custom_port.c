@@ -7,6 +7,7 @@
 #include "cold_code.h"
 #include "cold_code_custom_image.h"
 #include "cold_code_port.h"
+#include "cold_code_port_fast.h"
 #include "test_util.h"
 
 /*
@@ -67,12 +68,17 @@ static const cold_code_source_ops_t g_source_ops = {
 static cold_code_manager_t *g_managers[CUSTOM_CPUS];
 static _Thread_local unsigned g_cpu;
 
+/* Same per-thread pointer exported to the FAST_PATH assembly accessor. */
+_Thread_local cold_code_manager_t *cold_code_port_current_manager_fast
+    __attribute__((visibility("hidden")));
+
 static void custom_port_select_cpu(unsigned cpu) {
     g_cpu = cpu;
 }
 
 void cold_code_port_set_current(cold_code_manager_t *mgr) {
     g_managers[g_cpu] = mgr;
+    cold_code_port_current_manager_fast = mgr;
 }
 
 cold_code_manager_t *cold_code_port_current(void) {

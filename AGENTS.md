@@ -36,16 +36,17 @@ ctest --test-dir build -R cold_code --output-on-failure
 
 ```text
 cold_code/           平台无关核心 + port 契约
-  CMakeLists.txt     cold_code_core + cold_code_port_interface + COLD_CODE_HELPER
+  CMakeLists.txt     cold_code_core + port/fast interfaces + COLD_CODE_HELPER
   cmake/             cold_code_add_image() helper
   include/           核心公共 API（cold_code.h）
   port/include/      port 接口契约（cold_code_port.h）
+  arch/x86_64/       FAST_PATH accessor 契约 + layout + 编译期检查
   src/core/          manager + image + internal header
   linker/            cold_image.ld / cold_ram.ld
   tool/              gen_cold_code.py / verify_cold_ram.py / check_duplicate_symbols.py
-example/             消费者 + 参考宿主 port（port_host.c/.h）
-tests/               CTest 测试、负向 fixture、测试用 host port（support/）
-tests/consumer/      独立 consumer + 自带 host port
+example/             消费者 + 参考宿主 port（port_host.c/.h + fast .S）
+tests/               CTest 测试、负向 fixture、测试用 host port（support/）、benchmark
+tests/consumer/      独立 consumer + 自带 host port + fast accessor
 tool/                通用模板工具（init.py、vscode/）
 ```
 
@@ -75,11 +76,20 @@ tool/                通用模板工具（init.py、vscode/）
   cold_code_add_image(app NAME app SOURCES cold/app_cold.c SLOT_SIZE 64 POOL_SLOTS 1)
   ```
   一个 executable 只链接一个 port；嵌入式 port 实现自己的 current manager/fatal/source。
+  可选 `cold_code_add_image(... FAST_PATH ON)` 需要 port 额外提供 x86-64
+  `cold_code_port_current_fast`；不提供时保持默认 slow stub。
 - 库只提供 port 契约 `cold_code_port.h`；宿主文件/内存 source 的参考实现在
   `example/port_host.c/.h`，测试 harness 在 `tests/support/`。只使用核心 API 时
   include `cold_code.h`。
 - 核心库保留未解析的 `cold_code_port_*` 符号；只链接 `cold_code_core` 而不提供
   port 会在链接期报 undefined。
+- FAST_PATH 是可选 x86-64 特性：`cold_code_add_image(... FAST_PATH ON)` 生成命中
+  内联 stub，并额外要求 port 提供 `cold_code_port_current_fast`（私有 ABI，见
+  `cold_code/arch/x86_64/cold_code_port_fast.h`）。默认 OFF；自定义/嵌入式 port 可只
+  支持 slow stub。`cold_code/arch/x86_64/cold_code_fast_layout.h` 的 offset 由生成器
+  读取，并由 `fast_layout_check.c` 的 `_Static_assert` 校验。
+- 测试矩阵：`cold_code.basic` 用 slow stub；其余 host-based 测试/example/consumer 用
+  FAST_PATH ON；`test_custom_port` 提供自己的 per-CPU fast accessor。
 - `NAME` 必填、必须是 C 标识符，且在同一 target 内唯一。同一 target 多个 image 时
   分别传不同的 `OUTPUT_DIR`（默认已包含 target+name）。
 - 每个 image 生成独立 descriptor/storage 类型/stub，符号带 `NAME` 命名空间；同一
@@ -143,7 +153,7 @@ int app_cold_add(int lhs, int rhs) {
 
 - 测试使用纯 C + CTest，无第三方框架；断言宏在 `tests/test_util.h`，trace 回调在
   `tests/test_runtime.h`。
-- 测试分类（19 个）：
+- 测试分类（19 个 CTest；fast/slow 矩阵见上）：
   - 运行时：`cold_code.basic`、`cold_code.init`、`cold_code.lru_1way`、
     `cold_code.lru_2way`、`cold_code.abi`、`cold_code.preinit_abort`、
     `cold_code.image_format`、`cold_code.multi_manager`、
@@ -162,7 +172,10 @@ int app_cold_add(int lhs, int rhs) {
     `test_same_image_two_slots`、`test_custom_port`）。
   - host-based 测试链接 `cold_code_core` + `test_host_port`（`tests/support/`）；
     `test_custom_port` 故意只链接 `cold_code_core` 并在测试内实现 port + memory
-    source；不要给它加 `test_host_port` 或任何 host port，否则隔离测试失效。
+    source + fast accessor；不要给它加 `test_host_port` 或任何 host port，否则
+    隔离测试失效。
+  - `bench_fast` / `bench_slow` 是 benchmark target，不是 CTest；用
+    `./build/tests/bench_fast` / `bench_slow` 对比命中/缺失路径。
 - 新增构建失败测试：在 `tests/fixtures/` 放独立项目，用
   `tests/run_expect_build_failure.cmake` 配置/构建并匹配错误文本；运行时 abort 用
   `tests/run_expect_abort.cmake`。
@@ -178,6 +191,7 @@ int app_cold_add(int lhs, int rhs) {
   ```bash
   clang-format -i cold_code/src/core/*.c cold_code/src/core/*.h \
       cold_code/include/*.h cold_code/port/include/*.h \
+      cold_code/arch/x86_64/*.c cold_code/arch/x86_64/*.h \
       example/*.c example/*.h example/cold/*.c example/cold/*.h \
       tests/*.c tests/*.h tests/cold/*.c tests/cold/*.h \
       tests/support/*.c tests/support/*.h \
@@ -195,8 +209,8 @@ int app_cold_add(int lhs, int rhs) {
 - 消费方必须启用 ASM；Phase 3 计划去掉该前提。
 - stub 当前仅 x86-64；AVX `__m256` 参数上半部不保证。
 - 静态 RWX 段依赖内核/安全策略允许；嵌入式移植需替换 port 并做 cache 维护。
-- stub 当前每次冷调用都经过 C acquire；Phase 2 才加入命中快路径（host 用 TLS，
-  嵌入式 per-core port 使用自己的 manager 访问方式）。
+- FAST_PATH 当前只支持 x86-64 host；默认 OFF，slow stub 仍完整保留。嵌入式可先用
+  slow stub；per-core/ARM/RISC-V 的 fast accessor/layout/模板在 Phase 4。
 - 生产级 per-core port / ARM/RISC-V stub 在 Phase 4；当前 host 是 per-thread。
 - 同一个 manager 并发使用、跨 slot 直调、冷函数数据/重定位仍不支持（后续阶段）。
 
@@ -204,17 +218,20 @@ int app_cold_add(int lhs, int rhs) {
 
 - `cold_code/include/cold_code.h`：核心公共 API、manager/source/image 类型、`COLD_CODE()`。
 - `cold_code/port/include/cold_code_port.h`：port 实现契约（current manager/fatal）。
+- `cold_code/arch/x86_64/cold_code_port_fast.h`：可选 FAST_PATH accessor 契约。
+- `cold_code/arch/x86_64/cold_code_fast_layout.h`：stub offset 契约（生成器读取）。
 - `cold_code/src/core/manager.c`：manager 生命周期、storage owner、slot/LRU loader。
 - `cold_code/src/core/image.c`：image v2 头校验、CRC32、状态字符串。
-- `example/port_host.c/.h`：宿主参考 port（TLS/fatal/文件/内存 source）。
-- `tests/support/port_host.c/.h`：测试 harness 的 host port。
-- `tests/consumer/port_host.c/.h`：外部 consumer 自带的 host port。
+- `example/port_host.c/.h` + `port_host_fast_x86_64.S`：宿主参考 port/accessor。
+- `tests/support/port_host.c/.h` + `port_host_fast_x86_64.S`：测试 host port。
+- `tests/consumer/port_host.c/.h` + `port_host_fast_x86_64.S`：外部 consumer port。
 - `cold_code/cmake/ColdCodeImage.cmake`：`cold_code_add_image()`。
 - `cold_code/tool/gen_cold_code.py` / `verify_cold_ram.py` /
   `check_duplicate_symbols.py`：生成、RWX 校验、重复符号检查。
 - `example/main.c` / `example/cold/cold_functions.c`：最小消费者。
 - `tests/test_custom_port.c`：只链接 `cold_code_core` 的自定义 per-CPU port 示例。
-- `tests/CMakeLists.txt`：CTest 入口与负向 fixture。
+- `tests/bench_cold_call.c`：fast/slow 命中/缺失路径 benchmark。
+- `tests/CMakeLists.txt`：CTest 入口、benchmark target 与负向 fixture。
 
 ## 验证清单
 
@@ -222,5 +239,7 @@ int app_cold_add(int lhs, int rhs) {
 2. `ctest --test-dir build --output-on-failure` 19 个测试全部通过。
 3. `ctest -R 'lru|multi|same_image|custom_port|image_mismatch|reject|external_consumer' -V`
    可看到预期 trace/错误文本。
-4. 冷测试 target 的 POST_BUILD 输出包含 `flags RWE`。
-5. `BUILD_TESTING=OFF` 时库/示例仍可构建。
+4. `./build/tests/bench_fast` 与 `bench_slow` 对比 hit ns/call；fast 明显低于 slow。
+5. 冷测试 target 的 POST_BUILD 输出包含 `flags RWE`。
+6. core-only 链接仍因 `cold_code_port_*` undefined 失败；fast accessor 只存在于 port。
+7. `BUILD_TESTING=OFF` 时库/示例仍可构建。

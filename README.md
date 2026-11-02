@@ -22,7 +22,8 @@ int result = cold_code_add(2, 3);
 
 - `COLD_CODE()` 标注冷函数，自动进入独立冷镜像。
 - 固定大小 slot（默认 4096 字节，可配置），一个 slot 容纳多个函数；**每个函数必须完整落在一个 slot 内**。
-- **没有 function ID**：stub 携带“镜像 ID + slot 号 + slot 内偏移”；每次调用 `cold_code_acquire_slot()`，命中时刷新 LRU 时间戳，缺失时换入并在必要时淘汰。
+- **没有 function ID**：stub 携带“镜像 ID + slot 号 + slot 内偏移”；命中时刷新 LRU 时间戳，缺失时换入并在必要时淘汰。
+- 可选 x86-64 **FAST_PATH**：命中在生成 stub 内查 slot_map、更新 true-LRU tick 和 hits，直接尾跳；miss/异常才保存参数进入 C 慢路径。需要 port 提供 fast accessor。
 - 多 manager / 多 image：同一可执行可包含多个 image；同一 image 也可创建多个 manager。
 - execution-context current manager：宿主用线程 TLS，嵌入式可用 per-core/task-local；每个 manager 单执行上下文使用，无锁、无 pin。
 - 核心库与 port 完全分离：`cold_code_core` 只含 loader，库只提供 `cold_code_port.h` 契约；`example/port_host.c` 是宿主参考实现，嵌入式/自定义 port 由消费者提供并链接 core。
@@ -34,17 +35,97 @@ int result = cold_code_add(2, 3);
 - 构建期校验：函数跨 slot、跨 slot 直接调用、绝对重定位、GOT/PLT 依赖、未定义符号、同一可执行内跨 image 的重复冷函数名、RWX 段布局。
 - 输出 map/布局/符号文件：冷镜像与热端可执行文件的 GNU ld map、生成器布局表、跨 image 符号清单。
 
+## 当前版本的优缺点（Phase 2）
+
+> 当前实现主要面向 **x86-64 Linux 仿真**；嵌入式 per-core、ARM/RISC-V 仍在路线图中。
+
+### 优点
+
+1. **调用点透明**：热端就是普通函数调用；冷函数体不在热端，只有生成的同名 stub。
+   没有 function ID、句柄或显式 load API。
+2. **节省常驻空间**：冷函数不进入热端镜像；按固定 slot 按需加载，同 slot 多函数共享
+   一次读取；适合把错误处理、罕见功能放到 flash/ROM。
+3. **不依赖 OS 动态加载**：核心只用 `cold_code_source_ops_t` 读取 image；宿主 port 用
+   文件/内存模拟 flash；不依赖 `dlopen`、`mmap/mprotect` 按需分页、`SIGSEGV` 或
+   `userfaultfd`。
+4. **多实例/多执行上下文**：同一 image 可被多个 manager 使用，每个 manager 有独立
+   storage/pool/LRU/stats；宿主按线程 TLS，嵌入式可按 per-core/task-local；无锁、无 pin。
+5. **核心与 port 隔离**：库只有 `cold_code_core` + port 契约；宿主 port/source 在
+   example/tests/consumer 中各自实现；自定义/嵌入式 port 只需链接 core。
+   一个 storage 只能属于一个 manager（owner guard）。
+6. **镜像格式可校验**：v2 header 带 magic/version/image_id/slot 布局/payload CRC；
+   manager init 校验 descriptor 与镜像头；支持 file 与只读 memory source。
+7. **构建期守卫**：拒绝跨 slot 函数、跨 slot 直调、绝对重定位、GOT/PLT、未定义符号、
+   同一可执行内重复冷函数名/image_id；POST_BUILD 检查 `.cold_ram` 的 RWX 段。
+8. **可选快路径**：FAST_PATH 命中在 stub 内更新 true-LRU tick/hits 并尾跳；本机
+   benchmark 命中约 2.4–3.4× 于 slow 路径。默认 slow，按 port 能力显式开启。
+9. **可观测性**：每 manager 的 load/evict/hit/miss 统计、可选 trace 回调、layout/map/
+   symbols 文件，便于定位 slot 分配和 LRU 行为。
+10. **测试基础**：19 个 CTest 覆盖 LRU、ABI（栈参数/SSE/varargs/sret）、多 manager
+    双线程、同 image 不同 pool、自定义 per-CPU port、负向构建守卫；GCC/Clang/Release
+    均已跑通。
+
+### 缺点与代价
+
+1. **平台范围窄**：stub 和 FAST_PATH 目前只实现 x86-64；fast accessor 是私有 ABI +
+   local-exec TLS，只适合静态链接的宿主；ARM/RISC-V、per-core 生产 port 在 Phase 4。
+2. **冷函数约束强**：必须自包含（无 libc/外部数据/字符串/jump table/重定位）；每个
+   函数必须完整落在一个 slot；禁止跨 slot 直调；多 slot 函数、数据、函数指针跨 slot
+   都不支持。这会限制可放入冷端的代码形态。
+3. **并发模型有限**：一个 manager 只能由一个执行上下文使用；无锁、无 pin。冷函数执行
+   期间通过热端回调重入其他 slot 不安全；per-core 共享 manager 时同 core 多 task 必须
+   协作式执行，否则需 task-local manager。
+4. **性能代价**：FAST_PATH 仍有一次 accessor 调用和 stub 检查；默认 slow 路径开销更高。
+   miss/换入主要受 source 读取影响（本机文件 source 约 0.8–0.9 μs/call），没有异步
+   预取/DMA；固定 slot 有内部碎片，工作集超过 pool 会 LRU 抖动。
+5. **构建/交付尚未完整**：需要 Python3 生成器；消费方目前仍需启用 ASM；没有
+   `install()`/`export()`/`find_package()`；生成头路径宏是构建期绝对路径；移动构建树
+   需要重新生成或自行传路径；CI/ASan/UBSan 尚未接入。
+6. **安全边界有限**：payload CRC 只检测损坏，不是签名/认证；image 来源不可信时等于
+   允许执行任意冷代码；宿主依赖静态 RWX，可能被 W^X/安全策略拒绝；没有 MPU/沙箱/
+   guard page，冷代码与热端同权限运行。
+7. **ABI/接口稳定性**：manager 结构体和 FAST_PATH offset 是公开/锁定的实现细节；
+   目前不承诺跨版本 ABI 稳定；storage 必须静态零初始化并放 `.cold_ram`，忘记 section
+   属性时 verify 只检查 marker，不检查调用方 storage。
+8. **port 是链接期选择**：一个 executable 只能链接一个 port；没有运行时切换/多 port；
+   host reference、tests、consumer 各自复制 host port，存在维护重复。
+9. **验证范围有限**：测试/基准目前只在 x86-64 host；没有 ARM/嵌入式 QEMU、故障注入、
+   sanitizer CI；性能数字是合成 benchmark，不能代表所有 flash/RTOS 配置。
+10. **镜像/工具约束**：image 为 little-endian、基址 0 的 flat ELF；依赖 GNU 工具链/
+    GCC/Clang 的冷编译选项；`tool/init.py --module` 的模板重命名仍是旧逻辑。
+
+### 适用场景
+
+- flash/ROM 受限、希望把**冷路径/罕见功能**移出热端镜像的嵌入式或模拟项目。
+- 调用图相对静态、冷函数可以自包含、每个函数能放进固定 slot 的代码。
+- 每线程/每 core 独立 manager，或同一 core 上协作式执行冷代码的 RTOS/裸机场景。
+- 需要“普通函数调用”语义、无 OS 动态加载依赖、且能接受静态可执行 RAM 的项目。
+- 当前阶段：x86-64 Linux 上的原型/仿真；嵌入式能力随 Phase 4 补齐。
+
+### 不适用 / 需要额外设计
+
+- 任意第三方库/带静态数据、字符串、重定位或 jump table 的代码。
+- 紧耦合的冷函数跨 slot 调用、冷函数与热端回调频繁重入、需要 pinning 的场景。
+- 多线程共享同一个 manager、或要求抢占式任务安全共享 per-core manager 的场景。
+- 严格 W^X/MPU 隔离、不可信 image、需要代码签名/远程证明的生产安全场景。
+- 需要低首调用延迟且 flash 读取很慢、又没有预取/DMA 支持的工作负载。
+- 当前需要 ARM/RISC-V、install/find_package 或共享库形态的项目。
+
 ## 目录结构
 
 ```text
 .
 ├── CMakeLists.txt
 ├── cold_code/                     # 平台无关核心 + port 契约
-│   ├── CMakeLists.txt             # cold_code_core + cold_code_port_interface
+│   ├── CMakeLists.txt             # cold_code_core + port/fast interfaces
 │   ├── cmake/ColdCodeImage.cmake  # cold_code_add_image() 构建封装
 │   ├── include/cold_code.h        # 核心公共 API / COLD_CODE()
 │   ├── port/include/cold_code_port.h
 │   │                              # port 接口契约（current manager/fatal）
+│   ├── arch/x86_64/cold_code_port_fast.h
+│   │                              # 可选 FAST_PATH accessor 私有 ABI
+│   ├── arch/x86_64/cold_code_fast_layout.h
+│   │                              # stub 使用的 manager/image offset
 │   ├── src/core/manager.c         # manager 生命周期 / LRU / acquire
 │   ├── src/core/image.c           # image v2 头校验 / CRC32 / 状态字符串
 │   ├── src/core/cold_code_internal.h
@@ -56,16 +137,19 @@ int result = cold_code_add(2, 3);
 ├── example/
 │   ├── CMakeLists.txt
 │   ├── port_host.c/.h             # 参考宿主 port + 文件/内存 source
+│   ├── port_host_fast_x86_64.S    # FAST_PATH TLS accessor
 │   ├── cold/cold_functions.c      # COLD_CODE() 冷函数
 │   ├── cold/cold_functions.h
 │   └── main.c
 ├── tests/
 │   ├── CMakeLists.txt
 │   ├── support/port_host.c/.h     # 测试用宿主 port
+│   ├── support/port_host_fast_x86_64.S
 │   ├── test_*.c                   # 运行时测试（含 custom port）
+│   ├── bench_cold_call.c          # fast/slow 调用路径 benchmark
 │   ├── cold/                      # 测试冷源
 │   ├── fixtures/                  # 构建期负向 fixture
-│   └── consumer/                  # add_subdirectory 外部消费者（自带 port）
+│   └── consumer/                  # 外部消费者（自带 port + fast accessor）
 ├── tool/                          # 通用模板工具
 │   ├── init.py                    # 模板初始化 / .vscode 生成
 │   └── vscode/
@@ -77,11 +161,16 @@ int result = cold_code_add(2, 3);
 - 库只提供 port 契约头 `cold_code/port/include/cold_code_port.h`，不提供 port 实现。
 - `example/port_host.c/.h` 是宿主参考实现；`tests/support/` 和 `tests/consumer/`
   各自提供自己的 port，证明库与平台解耦。
+- `cold_code/arch/x86_64/` 提供可选 FAST_PATH 的 accessor 契约和布局头；生成器读取
+  布局头，`fast_layout_check.c` 用 `_Static_assert` 校验 C 侧 offset。
 - 库源文件使用显式列表，避免 port/source 被误编进 core。
 
 ## 构建与运行
 
-需要 CMake >= 3.20、支持 C17 的 GCC/Clang、GNU ld（当前 stub 与 RWX 段方案面向 x86-64 Linux）。
+需要 CMake >= 3.20、支持 C17 与 ASM 的 GCC/Clang、GNU ld、Python3；当前 stub/FAST_PATH
+与 RWX 段方案面向 **x86-64 Linux**。宿主仿真需要内核允许 RWX `PT_LOAD`；嵌入式由
+链接脚本/可执行 RAM/MPU 策略决定。当前未提供 `install()`/`find_package()`，使用源码
+`add_subdirectory`（Phase 3 计划）。
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
@@ -115,7 +204,7 @@ loaded final: 1/1 (image slots: 3)
 
 ## 测试
 
-测试使用纯 C + CTest，位于 `tests/`：
+测试使用纯 C + CTest，位于 `tests/`；当前共 19 个 CTest（另有两个 benchmark target）：
 
 ```bash
 ctest --test-dir build --output-on-failure      # 全部测试
@@ -125,17 +214,35 @@ ctest --test-dir build -R lru -V                # 查看 LRU load/evict trace
 
 覆盖范围：
 
-- 运行时：basic 调用与 slot 共享、manager 生命周期/参数校验/reset、1-way/2-way LRU、
-  ABI（栈参数、SSE、varargs、大结构体返回）、未设置 current manager abort、image v2 头/CRC/
-  截断校验、同一 image 双 manager 双线程、同一 image 加载到两个不同物理 slot
-  （自地址校验）、只链接 `cold_code_core` 的自定义 per-CPU port、同一可执行双 image、
+- 运行时：basic 调用与 slot 共享（slow stub）、manager 生命周期/参数校验/reset、
+  1-way/2-way LRU（fast stub）、ABI（栈参数、SSE、varargs、大结构体返回，fast stub）、
+  未设置 current manager abort（fast→slow）、image v2 头/CRC/截断校验、同一 image
+  双 manager 双线程、同一 image 加载到两个不同物理 slot（自地址校验）、只链接
+  `cold_code_core` 的自定义 per-CPU port（fast stub）、同一可执行双 image、
   image_id 误用 abort、example smoke。
+- 性能：`bench_fast` / `bench_slow` 对比命中/缺失调用路径（不注册为 CTest）。
 - 构建期守卫：跨 slot 调用、函数跨 slot、自包含违规、缺少 ASM、同一可执行重复冷函数名都会按预期构建失败。
 - 外部 consumer：独立工程通过 `add_subdirectory(cold_code)` 构建运行，并自带 host port；
   验证 `cold_code_core` + 自实现 port 的消费方式。
 - host-based 测试通过 `tests/support/port_host.c` 链接自己的 port；库本身不含 host port。
 
 `-DBUILD_TESTING=OFF` 可只构建库和示例。agent 工作约定见 [`AGENTS.md`](AGENTS.md)。
+
+## 性能
+
+当前 benchmark 是 host 合成测试（文件 source，fast/slow 各一个 image）：
+
+| 路径 | 本机结果 | 说明 |
+|---|---|---|
+| fast hit | ≈ 2.3–3.2 ns/call | FAST_PATH ON；stub 内查表 + LRU 更新 |
+| slow hit | ≈ 7.5–7.8 ns/call | 原 C acquire 路径（完整参数保存 + 调用） |
+| miss/换入 | ≈ 0.8–0.9 μs/call | 主要受文件 source 读取影响 |
+
+- 环境：WSL2 x86-64，GCC Debug 构建，benchmark 源使用 `-O2`；仅作量级参考。
+- 运行：`./build/tests/bench_fast` 与 `./build/tests/bench_slow`。
+- FAST_PATH 只优化命中；miss 仍走 C 慢路径 + source 读取，没有异步预取/DMA。
+- 默认 FAST_PATH OFF；example/tests/consumer 显式开启，`cold_code.basic` 保持 slow
+  以覆盖回退路径。嵌入式 flash/DMA/RTOS 的数字需在目标平台重测。
 
 ## 工作原理
 
@@ -150,22 +257,31 @@ ctest --test-dir build -R lru -V                # 查看 LRU load/evict trace
    - `cold_code_<name>_layout.map` 与 `cold_code_<name>_symbols.txt`。
 4. 热端链接时用 `cold_ram.ld` 把调用方的 storage 和生成的 marker 放进独立 RWX `PT_LOAD`；POST_BUILD 用 `verify_cold_ram.py` 检查 marker 所在段确实可写可执行。
 
-运行期：
+运行期（FAST_PATH ON）：
 
 ```text
 cold_code_add(2, 3)
-  └─ stub: 保存参数寄存器；image_id + image_slot
-       call cold_code_acquire_slot
-         ├─ 取当前执行上下文的 current manager；校验 image_id/slot
-         ├─ 命中：刷新该 way 的 LRU tick，返回 way 基址
-         └─ 缺失：选空闲 way；若池满则淘汰 way_used 最小的 way
-                  从 source 读取整个 image slot 到该 way，返回 way 基址
-       恢复参数寄存器；r11 = way 基址 + slot 内偏移
-       jmp *%r11
+  └─ stub: call cold_code_port_current_fast   ; manager in r11, args preserved
+       ├─ 校验 initialized/image_id/slot/slot_map
+       ├─ 命中：tick++；way_used[way] = tick；hits++
+       │        r10 = pool + way*slot_size + intra；jmp *r10
+       └─ 慢路径：保存参数；call cold_code_acquire_slot
+                  （miss/换出/错误处理）
+```
+
+FAST_PATH OFF 时保持原路径：
+
+```text
+stub: 保存全部 GPR/SSE 参数
+      call cold_code_acquire_slot
+      （取 current manager；校验；命中刷新 LRU 或缺失换入）
+      恢复参数；r11 = way base + intra；jmp *r11
 ```
 
 - 冷镜像按 slot 拷贝到物理 way；函数运行地址 = `way_base + intra_offset`。
-- 每个 stub 每次调用都会经过 `cold_code_acquire_slot()`，因此命中也会更新 LRU；这是“无 function ID + 真正 LRU”的代价。
+- 命中路径也必须刷新 LRU tick 和 hits；FAST_PATH 在 stub 内完成。
+- FAST_PATH 需要 port 提供 x86-64 fast accessor（`cold_code_port_current_fast`）；
+  默认 OFF，自定义/嵌入式 port 可以只支持 slow stub。
 - 同一 slot 内的冷函数直接互调是安全的：整个 slot 已驻留，相对位移不变；跨 slot 直接调用在构建期被拒绝。
 - stub 保存 SysV 参数寄存器（`rax`/AL、`rdi`、`rsi`、`rdx`、`rcx`、`r8`、`r9`、`xmm0-7`），栈参数不受影响；尾跳转不引入额外栈帧。
 - stub 入口与冷函数入口都包含 `endbr64`（冷函数由 `-fcf-protection=branch` 生成），兼容启用 CET/IBT 的目标。
@@ -230,7 +346,7 @@ printf("%d\n", cold_code_add(2, 3));
 3. 在 CMake 中为可执行目标添加冷镜像；`NAME` 必填且在同一 target 内唯一：
 
 ```cmake
-add_executable(example main.c port_host.c)   # port_host.c 实现 cold_code_port.h
+add_executable(example main.c port_host.c port_host_fast_x86_64.S)
 target_link_libraries(example PRIVATE cold_code_core project_warnings)
 
 cold_code_add_image(example
@@ -238,6 +354,7 @@ cold_code_add_image(example
     SOURCES cold/cold_functions.c
     SLOT_SIZE 64
     POOL_SLOTS 1
+    FAST_PATH ON   # 可选；需要 port 提供 cold_code_port_current_fast
 )
 ```
 
@@ -329,12 +446,17 @@ cold_code_core (STATIC)             # manager/image/loader，无平台实现
   `tests/consumer/` 各自提供自己的 port。
 - 核心库引用 `cold_code_port_*` 但不定义它们；只链接 `cold_code_core` 而不提供
   port 会在链接期得到 undefined symbol。
+- 可选 FAST_PATH 额外要求 port 实现 `cold_code_port_current_fast`（x86-64 私有 ABI）。
+  `cold_code_add_image(... FAST_PATH ON)` 才会引用它；默认 OFF 使用可移植 slow stub。
+  `example/port_host_fast_x86_64.S` / tests/support / consumer 各自提供 accessor。
 
 消费者提供 port 实现（参考 `example/port_host.c`）：
 
 ```cmake
 add_executable(app main.c app_port.c)   # app_port 实现 cold_code_port.h
 target_link_libraries(app PRIVATE cold_code_core)
+# 可选：cold_code_add_image(... FAST_PATH ON) 需要 app_port 同时提供
+# cold_code_port_current_fast（x86-64）。
 ```
 
 - 自定义 port 可以提供自己的 `cold_code_source_ops_t`；宿主文件/内存 source 的
@@ -362,6 +484,7 @@ cold_code_add_image(app
     SOURCES cold/app_cold.c
     SLOT_SIZE 64
     POOL_SLOTS 1
+    # FAST_PATH ON   # 可选；app_port 还需提供 cold_code_port_current_fast
 )
 ```
 
@@ -387,6 +510,7 @@ cold_code_add_image(app
 | `cold_code_manager_current()` | 返回当前执行上下文的 current manager 或 `NULL` |
 | `cold_code_manager_stats(mgr, out)` | 每 manager 的 image/pool/loaded/loads/evictions/hits/misses |
 | `cold_code_port_set_current/current/fatal/abort` | port 实现契约；一个 executable 一个 port（`cold_code_port.h`） |
+| `cold_code_port_current_fast` | 可选 FAST_PATH accessor；x86-64 私有 ABI（`arch/x86_64/cold_code_port_fast.h`） |
 | `COLD_CODE_PORT_API_VERSION` | port 接口版本（`cold_code_port.h`） |
 | `cold_code_status_string(status)` | 状态码文本（`cold_code.h`） |
 | `COLD_CODE_MAX_POOL_SLOTS` | 每 manager 池容量上限（16） |
@@ -428,8 +552,24 @@ manifest，列出函数、slot、intra offset 和镜像元数据。
 - per-core manager 被同一 core 的多个 task 共享时，冷代码必须协作式执行（或每 core 只跑一个冷代码 task）；否则使用 task-local manager。
 - 冷函数执行期间不要通过热端回调或函数指针再次进入**其他 slot** 的冷代码：loader 不 pin 当前 slot，重入换入可能覆盖正在执行的代码。同 slot 内直接互调是安全的；跨 slot 直调在构建期被拒绝。
 - 调用冷函数前必须先 `cold_code_manager_use()`；没有 current manager 时会 abort 并给出明确信息。
-- stub 完整保存 SysV GPR/SSE 参数与返回值；栈参数、varargs、大结构体返回已验证。AVX `__m256` 参数的上半部不保证。
-- 当前只实现 x86-64 stub 模板；换 ISA 需要扩展生成器的 stub 模板与冷编译选项。
+- slow stub 完整保存 SysV GPR/SSE 参数与返回值；FAST_PATH 命中只 push/pop rax/rcx，
+  依赖 port accessor 保留其余参数寄存器。栈参数、varargs、大结构体返回已验证；AVX
+  `__m256` 参数的上半部不保证。
+- 当前只实现 x86-64 stub/FAST_PATH 模板；嵌入式可先用 slow stub，ARM/RISC-V 的
+  arch 模板/accessor 在 Phase 4 增加。
+
+## 安全与可靠性
+
+- **image 就是可执行代码**：不要把不可信来源的 image 交给 loader。CRC32 只检测意外
+  损坏，不是签名/认证；生产环境应在加载前做签名/安全启动校验。
+- 宿主依赖静态 RWX 段；若内核/安全策略禁止 W^X，需要改链接/port 方案。当前没有
+  MPU/沙箱/guard page，冷代码与热端同权限运行。
+- loader 校验 image header、descriptor、payload 范围和 CRC（可选）；slot 边界在 C
+  路径检查。生成 stub 和 `slot_map` 属于内部受信状态，损坏后可能跳入错误代码。
+- 没有 pinning：一个 manager 只能由一个执行上下文使用；冷函数执行期间通过热端回调
+  重入其他 slot 是不安全的。storage owner guard 只能防止两个 manager 共享同一 storage。
+- 默认 fatal 处理是打印后 `abort()`；嵌入式 port 可改为 trap/reset。建议在
+  provisioning 阶段校验/签名 image，并在目标平台启用 W^X/MPU/看门狗等保护。
 
 ## 嵌入式移植
 
@@ -447,7 +587,9 @@ target_link_libraries(app PRIVATE cold_code_core app_port)
   地址读取。
 - current manager：宿主用 `_Thread_local`；裸机/RTOS 可换成 per-core/task-local 实现
   （per-core port 在 Phase 4 实现/测试；核心不读取 CPU ID）。`tests/test_custom_port.c`
-  是一个 host 上模拟 per-CPU port 的完整示例。
+  是一个 host 上模拟 per-CPU port 的完整示例（含 FAST_PATH accessor）。
+- FAST_PATH：当前只支持 x86-64 host；嵌入式可用 slow stub，或在 Phase 4 提供对应
+  arch 的 accessor/布局模板。
 - fatal：宿主打印后 `abort()`；嵌入式可改为 trap/reset。
 - storage：调用方把生成的 storage 放到可执行 RAM（ITCM/DTCM 等）；加载 slot 后按平台要求做
   D-cache 回写与 I-cache 无效化。
@@ -508,16 +650,18 @@ v1 的行为约束（slot 级 LRU、无 function ID、每函数单 slot、禁止
 ## v2 状态
 
 - Phase 1（已实现）：manager/storage/TLS、多 image/多 manager、image v2 + file/memory source、
-  generator/helper、example/tests 迁移。当前 stub 仍调用 C acquire 路径。
+  generator/helper、example/tests 迁移。
 - Phase 1.5（已实现）：storage owner guard（一 storage 一 manager）、同 image 双 manager
   加载到不同物理 slot 的地址验证、执行上下文（线程/CPU）文档与 port 契约。
 - Phase 1.6（已实现）：核心库 `cold_code_core` 与 port 完全分离；库只保留
   `cold_code_port.h` 契约；host port/source 移到 `example/port_host.c`，tests/consumer
   各自提供自己的 port；自定义 per-CPU port 测试。
-  默认 `cold_code` 仍链接 core + host port。
-- Phase 2（计划）：stub 快路径（current manager + slot map + true-LRU tick），C 慢路径只在
-  miss 时执行；host 用 TLS，嵌入式 per-core port 使用自己的 manager 访问方式。
-- Phase 3（计划）：install/export/find_package、去掉 ASM 前提、CI、sanitizer。
+- Phase 2（已实现）：可选 x86-64 FAST_PATH；命中在 stub 内更新 true-LRU tick/hits 并尾跳，
+  miss/异常走 C 慢路径；port 提供 `cold_code_port_current_fast` 私有 accessor；布局头
+  + `_Static_assert` 锁定 offset。basic 保持 slow stub，其余 host 测试/example/consumer
+  使用 FAST_PATH。
+- 性能数据与复测方法见上文「性能」一节。
+- Phase 3（下一阶段）：install/export/find_package、去掉 ASM 前提、CI、sanitizer。
 - Phase 4（计划）：freestanding core、per-core/task-local port、嵌入式 source/cache/RTOS port、
   ARM/RISC-V 模板。
 - Phase 5（计划）：packer、跨 slot/冷调热 trampoline、数据/重定位、multi-slot 函数。
@@ -527,6 +671,7 @@ v1 的行为约束（slot 级 LRU、无 function ID、每函数单 slot、禁止
 ```bash
 clang-format -i cold_code/src/core/*.c cold_code/src/core/*.h \
     cold_code/include/*.h cold_code/port/include/*.h \
+    cold_code/arch/x86_64/*.c cold_code/arch/x86_64/*.h \
     example/*.c example/*.h example/cold/*.c example/cold/*.h \
     tests/*.c tests/*.h tests/cold/*.c tests/cold/*.h \
     tests/support/*.c tests/support/*.h \

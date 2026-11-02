@@ -53,7 +53,8 @@ function(cold_code_add_image target)
     set(verifier "${cold_code_dir}/tool/verify_cold_ram.py")
     set(duplicate_checker "${cold_code_dir}/tool/check_duplicate_symbols.py")
 
-    cmake_parse_arguments(ARG "" "NAME;SLOT_SIZE;POOL_SLOTS;OUTPUT_DIR" "SOURCES" ${ARGN})
+    cmake_parse_arguments(ARG "" "NAME;SLOT_SIZE;POOL_SLOTS;OUTPUT_DIR;FAST_PATH;FAST_ACCESSOR"
+                          "SOURCES" ${ARGN})
 
     if(NOT ARG_NAME)
         message(FATAL_ERROR "cold_code_add_image: NAME is required")
@@ -76,6 +77,44 @@ function(cold_code_add_image target)
     endif()
     if(ARG_POOL_SLOTS LESS 1 OR ARG_POOL_SLOTS GREATER 16)
         message(FATAL_ERROR "cold_code_add_image: POOL_SLOTS must be between 1 and 16")
+    endif()
+
+    set(fast_enabled FALSE)
+    set(fast_generator_args)
+    set(fast_accessor "cold_code_port_current_fast")
+    if(ARG_FAST_PATH)
+        string(TOUPPER "${ARG_FAST_PATH}" fast_path_upper)
+        if(fast_path_upper STREQUAL "ON")
+            set(fast_enabled TRUE)
+        elseif(fast_path_upper STREQUAL "OFF")
+            set(fast_enabled FALSE)
+        else()
+            message(FATAL_ERROR "cold_code_add_image: FAST_PATH must be ON or OFF")
+        endif()
+    endif()
+    if(ARG_FAST_ACCESSOR)
+        set(fast_accessor "${ARG_FAST_ACCESSOR}")
+    endif()
+    if(fast_enabled)
+        string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" cold_code_arch_lower)
+        if(NOT cold_code_arch_lower MATCHES "^(x86_64|amd64)$")
+            message(FATAL_ERROR
+                "cold_code_add_image: FAST_PATH is currently implemented only for x86-64 "
+                "(target processor '${CMAKE_SYSTEM_PROCESSOR}')")
+        endif()
+        set(fast_layout "${cold_code_dir}/arch/x86_64/cold_code_fast_layout.h")
+        if(NOT EXISTS "${fast_layout}")
+            message(FATAL_ERROR "cold_code_add_image: missing FAST_PATH layout ${fast_layout}")
+        endif()
+        if(NOT TARGET cold_code_fast_x86_64)
+            message(FATAL_ERROR
+                "cold_code_add_image: FAST_PATH requires the cold_code_fast_x86_64 target")
+        endif()
+        target_link_libraries(${target} PRIVATE cold_code_fast_x86_64)
+        list(APPEND fast_generator_args
+            --fast-path
+            --fast-layout "${fast_layout}"
+            --fast-accessor "${fast_accessor}")
     endif()
 
     # Names must be unique per target so generated symbols and convenience
@@ -161,6 +200,11 @@ function(cold_code_add_image target)
         VERBATIM
     )
 
+    set(generator_deps "${elf}" "${raw_bin}" "${generator}")
+    if(fast_enabled)
+        list(APPEND generator_deps "${fast_layout}")
+    endif()
+
     add_custom_command(
         OUTPUT "${final_bin}" "${gen_header}" "${gen_source}" "${gen_stubs}"
                "${layout_map}" "${symbols}"
@@ -179,7 +223,8 @@ function(cold_code_add_image target)
                 --stubs "${gen_stubs}"
                 --layout-map "${layout_map}"
                 --symbols "${symbols}"
-        DEPENDS "${elf}" "${raw_bin}" "${generator}"
+                ${fast_generator_args}
+        DEPENDS ${generator_deps}
         COMMENT "Generating cold code stubs and image ${ARG_NAME}"
         VERBATIM
     )

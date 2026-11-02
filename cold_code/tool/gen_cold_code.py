@@ -33,10 +33,42 @@ IMAGE_VERSION = 2
 HEADER_FORMAT = "<IHHIIIIIII"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 IMAGE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+FAST_LAYOUT_DEFINE_RE = re.compile(r"^\s*#define\s+(COLD_CODE_FAST_OFF_[A-Z0-9_]+)\s+(\d+)\b")
+FAST_ACCESSOR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+FAST_LAYOUT_REQUIRED = {
+    "COLD_CODE_FAST_OFF_MGR_IMAGE",
+    "COLD_CODE_FAST_OFF_MGR_SLOT_MAP",
+    "COLD_CODE_FAST_OFF_MGR_WAY_USED",
+    "COLD_CODE_FAST_OFF_MGR_POOL",
+    "COLD_CODE_FAST_OFF_MGR_POOL_SLOTS",
+    "COLD_CODE_FAST_OFF_MGR_TICK",
+    "COLD_CODE_FAST_OFF_MGR_STATS_HITS",
+    "COLD_CODE_FAST_OFF_MGR_INITIALIZED",
+    "COLD_CODE_FAST_OFF_IMAGE_ID",
+    "COLD_CODE_FAST_OFF_IMAGE_SLOT_SIZE",
+    "COLD_CODE_FAST_OFF_IMAGE_SLOT_COUNT",
+}
 
 
 class GenError(Exception):
     pass
+
+
+def parse_fast_layout(path: str) -> dict[str, int]:
+    values: dict[str, int] = {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                match = FAST_LAYOUT_DEFINE_RE.match(line)
+                if match:
+                    values[match.group(1)] = int(match.group(2))
+    except OSError as exc:
+        raise GenError(f"cannot read FAST_PATH layout header {path}: {exc}") from exc
+
+    missing = sorted(FAST_LAYOUT_REQUIRED - values.keys())
+    if missing:
+        raise GenError(f"FAST_PATH layout header {path} is missing: {', '.join(missing)}")
+    return values
 
 
 def run_tool(cmd: list[str]) -> str:
@@ -355,6 +387,14 @@ def generate(args: argparse.Namespace) -> None:
     ]
     write_text(args.image_source, "\n".join(source_lines))
 
+    fast_layout = None
+    if args.fast_path:
+        if not args.fast_layout:
+            raise GenError("FAST_PATH requires --fast-layout")
+        if not FAST_ACCESSOR_RE.match(args.fast_accessor):
+            raise GenError(f"invalid fast accessor symbol '{args.fast_accessor}'")
+        fast_layout = parse_fast_layout(args.fast_layout)
+
     # --- Hot stubs and RWX section marker ----------------------------------
     marker = f"cold_code_ram_marker_{name}"
     asm = [
@@ -371,16 +411,60 @@ def generate(args: argparse.Namespace) -> None:
         "    .section .text",
     ]
 
-    for fn in globals_:
+    for index, fn in enumerate(globals_):
         fn_name = fn["name"]
         image_slot = fn["offset"] // args.slot_size
         intra_offset = fn["offset"] % args.slot_size
+
         asm += [
             "    .p2align 4",
             f"    .globl {fn_name}",
             f"    .type {fn_name}, @function",
             f"{fn_name}:",
             "    .byte 0xf3,0x0f,0x1e,0xfa",  # endbr64
+        ]
+
+        if fast_layout is not None:
+            slow_label = f".Lcold_code_slow_{index}"
+            off = fast_layout
+            asm += [
+                f"    call {args.fast_accessor}",
+                "    testq %r11, %r11",
+                f"    je {slow_label}",
+                f"    cmpb $0, {off['COLD_CODE_FAST_OFF_MGR_INITIALIZED']}(%r11)",
+                f"    je {slow_label}",
+                f"    movq {off['COLD_CODE_FAST_OFF_MGR_IMAGE']}(%r11), %r10",
+                f"    cmpl $0x{image_id:08x}, {off['COLD_CODE_FAST_OFF_IMAGE_ID']}(%r10)",
+                f"    jne {slow_label}",
+                f"    cmpl ${image_slot}, {off['COLD_CODE_FAST_OFF_IMAGE_SLOT_COUNT']}(%r10)",
+                f"    jbe {slow_label}",
+                f"    movq {off['COLD_CODE_FAST_OFF_MGR_SLOT_MAP']}(%r11), %r10",
+                f"    movl {image_slot * 4}(%r10), %r10d",
+                "    testl %r10d, %r10d",
+                f"    je {slow_label}",
+                f"    cmpl {off['COLD_CODE_FAST_OFF_MGR_POOL_SLOTS']}(%r11), %r10d",
+                f"    ja {slow_label}",
+                "    subl $1, %r10d",
+                "    pushq %rax",
+                "    pushq %rcx",
+                f"    movq {off['COLD_CODE_FAST_OFF_MGR_TICK']}(%r11), %rax",
+                "    incq %rax",
+                f"    movq %rax, {off['COLD_CODE_FAST_OFF_MGR_TICK']}(%r11)",
+                f"    movq {off['COLD_CODE_FAST_OFF_MGR_WAY_USED']}(%r11), %rcx",
+                "    movq %rax, (%rcx,%r10,8)",
+                f"    incq {off['COLD_CODE_FAST_OFF_MGR_STATS_HITS']}(%r11)",
+                f"    movq {off['COLD_CODE_FAST_OFF_MGR_IMAGE']}(%r11), %rcx",
+                f"    movl {off['COLD_CODE_FAST_OFF_IMAGE_SLOT_SIZE']}(%rcx), %ecx",
+                "    imulq %rcx, %r10",
+                f"    addq {off['COLD_CODE_FAST_OFF_MGR_POOL']}(%r11), %r10",
+                f"    addq ${intra_offset}, %r10",
+                "    popq %rcx",
+                "    popq %rax",
+                "    jmp *%r10",
+                f"{slow_label}:",
+            ]
+
+        asm += [
             "    pushq %rax",
             "    pushq %rdi",
             "    pushq %rsi",
@@ -435,6 +519,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--stubs", required=True)
     parser.add_argument("--layout-map", required=True)
     parser.add_argument("--symbols", required=True)
+    parser.add_argument("--fast-path", action="store_true")
+    parser.add_argument("--fast-layout")
+    parser.add_argument("--fast-accessor", default="cold_code_port_current_fast")
     args = parser.parse_args(argv)
 
     try:
