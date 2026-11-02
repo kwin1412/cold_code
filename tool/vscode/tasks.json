@@ -55,9 +55,16 @@
             "problemMatcher": []
         },
         {
+            "label": "测试: ctest",
+            "type": "shell",
+            "command": "ctest --test-dir build --output-on-failure",
+            "dependsOn": "CMake: 构建",
+            "problemMatcher": []
+        },
+        {
             "label": "格式化: clang-format",
             "type": "shell",
-            "command": "clang-format -i cold_code/src/*.c cold_code/src/*.h cold_code/include/*.h example/*.c example/cold/*.c example/cold/*.h",
+            "command": "clang-format -i cold_code/src/*.c cold_code/src/*.h cold_code/include/*.h example/*.c example/cold/*.c example/cold/*.h tests/*.c tests/*.h tests/cold/*.c tests/cold/*.h tests/consumer/*.c tests/fixtures/*/*.c",
             "problemMatcher": []
         }
     ]

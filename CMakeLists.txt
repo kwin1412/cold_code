@@ -9,6 +9,8 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+include(CTest)
+
 add_library(project_warnings INTERFACE)
 target_compile_options(project_warnings INTERFACE
     -Wall
@@ -21,3 +23,7 @@ target_compile_options(project_warnings INTERFACE
 add_subdirectory(cold_code)
 include("${COLD_CODE_HELPER}")
 add_subdirectory(example)
+
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()

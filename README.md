@@ -88,6 +88,25 @@ loaded final: 1/1 (image slots: 3)
 - `mul` 位于 slot 1，换入时淘汰 slot 0；再次调用 `add` 又换回 slot 0。
 - 池容量始终为 1，`loaded` 不会超过 `pool slots`。
 
+## 测试
+
+测试使用纯 C + CTest，位于 `tests/`：
+
+```bash
+ctest --test-dir build --output-on-failure      # 全部测试
+ctest --test-dir build -R cold_code --output-on-failure
+ctest --test-dir build -R lru -V                # 查看 LRU load/evict trace
+```
+
+覆盖范围：
+
+- 运行时：basic 调用与 slot 共享、init descriptor 校验、1-way/2-way LRU、
+  ABI（栈参数、SSE、varargs、大结构体返回）、未 init abort、example smoke。
+- 构建期守卫：跨 slot 调用、函数跨 slot、自包含违规、缺少 ASM 都会按预期构建失败。
+- 外部 consumer：独立工程通过 `add_subdirectory(cold_code)` 构建运行，验证库自包含。
+
+`-DBUILD_TESTING=OFF` 可只构建库和示例。agent 工作约定见 [`AGENTS.md`](AGENTS.md)。
+
 ## 工作原理
 
 构建期（`cold_code_add_image()`）：
@@ -287,7 +306,9 @@ global  cold_code_div                     0x00000080 0x0000000a     2  0x0000
 
 ```bash
 clang-format -i cold_code/src/*.c cold_code/src/*.h cold_code/include/*.h \
-    example/*.c example/cold/*.c example/cold/*.h
+    example/*.c example/cold/*.c example/cold/*.h \
+    tests/*.c tests/*.h tests/cold/*.c tests/cold/*.h \
+    tests/consumer/*.c tests/fixtures/*/*.c
 ```
 
 部分发行版只提供带版本号的可执行文件（如 `clang-format-22`），按实际命令替换。
