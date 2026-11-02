@@ -1,4 +1,4 @@
-# project_tmp
+# cold-code
 
 一个最小的 C17 工程模板：静态库与示例程序，使用 CMake 构建。
 
@@ -7,9 +7,9 @@
 ```text
 .
 ├── CMakeLists.txt
-├── module/
-│   ├── include/module.h
-│   └── src/module.c
+├── cold_code/
+│   ├── include/cold_code.h
+│   └── src/cold_code.c
 ├── example/
 │   └── main.c
 ├── tool/
@@ -17,7 +17,7 @@
 └── .gitignore
 ```
 
-`module/src/` 与 `module/include/` 下的文件由 CMake 自动递归扫描，新增文件无需修改 `CMakeLists.txt`。
+`cold_code/src/` 与 `cold_code/include/` 下的文件由 CMake 自动递归扫描，新增文件无需修改 `CMakeLists.txt`。
 
 ## 构建与运行
 
@@ -32,5 +32,5 @@ cmake --build build -j
 ## 代码格式化
 
 ```bash
-clang-format -i module/src/*.c module/include/*.h example/*.c
+clang-format -i cold_code/src/*.c cold_code/include/*.h example/*.c
 ```

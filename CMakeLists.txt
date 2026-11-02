@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-set(PROJECT_NAME project_tmp)
+set(PROJECT_NAME cold-code)
 
 project(${PROJECT_NAME} VERSION 0.1.0 LANGUAGES C)
 
@@ -18,5 +18,5 @@ target_compile_options(project_warnings INTERFACE
     -Werror
 )
 
-add_subdirectory(module)
+add_subdirectory(cold_code)
 add_subdirectory(example)

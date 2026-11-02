@@ -1,5 +1,5 @@
-#ifndef MODULE_H
-#define MODULE_H
+#ifndef COLD_CODE_H
+#define COLD_CODE_H
 
 #ifdef __cplusplus
 extern "C" {
@@ -12,18 +12,18 @@ extern "C" {
  * @param rhs Right operand.
  * @return The sum of lhs and rhs.
  */
-int module_add(int lhs, int rhs);
+int cold_code_add(int lhs, int rhs);
 
 /**
- * Return the module version string.
+ * Return the cold_code version string.
  *
  * Keep this in sync with the project version declared in the top-level
  * CMakeLists.txt.
  */
-const char *module_version(void);
+const char *cold_code_version(void);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* MODULE_H */
+#endif /* COLD_CODE_H */
