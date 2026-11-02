@@ -57,7 +57,7 @@
         {
             "label": "格式化: clang-format",
             "type": "shell",
-            "command": "clang-format -i cold_code/src/*.c cold_code/include/*.h example/*.c",
+            "command": "clang-format -i cold_code/src/*.c cold_code/src/*.h cold_code/include/*.h example/*.c example/cold/*.c example/cold/*.h",
             "problemMatcher": []
         }
     ]
