@@ -1,40 +1,71 @@
 #include "cold_code_internal.h"
-#include "cold_code_port.h"
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #define COLD_CODE_CRC_CHUNK 512u
 
-static bool valid_image_descriptor(const cold_code_image_t *image) {
-    if (image == NULL || image->slot_size == 0u || image->slot_count == 0u) {
-        return false;
-    }
-    if (image->pool_slot_count == 0u || image->pool_slot_count > COLD_CODE_MAX_POOL_SLOTS ||
-        image->pool_slot_count > image->slot_count) {
-        return false;
-    }
-    return (uint64_t)image->slot_size * (uint64_t)image->slot_count <= UINT32_MAX;
+static struct cold_code_manager_impl *impl_of(cold_code_manager_t *manager) {
+    return (struct cold_code_manager_impl *)manager;
 }
 
-static bool manager_storage_is_bound(const cold_code_manager_t *mgr) {
-    return mgr->storage != NULL && mgr->slot_map != NULL && mgr->way_slot != NULL &&
-           mgr->way_used != NULL && mgr->pool != NULL && mgr->pool_slots != 0u;
+static const struct cold_code_manager_impl *impl_of_const(const cold_code_manager_t *manager) {
+    return (const struct cold_code_manager_impl *)manager;
 }
 
-static void clear_residency(cold_code_manager_t *mgr) {
-    for (uint32_t i = 0; i < mgr->image->slot_count; ++i) {
-        mgr->slot_map[i] = 0u;
-    }
-    for (uint32_t way = 0; way < mgr->pool_slots; ++way) {
-        mgr->way_slot[way] = COLD_CODE_INVALID_SLOT;
-        mgr->way_used[way] = 0u;
-    }
-    mgr->tick = 0u;
-    mgr->stats = (cold_code_stats_t){0};
+static bool manager_is_ready(const struct cold_code_manager_impl *manager) {
+    return manager != NULL && manager->manager_magic == COLD_CODE_MANAGER_MAGIC &&
+           (manager->fast.state & COLD_CODE_MANAGER_STATE_READY) != 0u;
 }
 
-static cold_code_status_t verify_payload_crc(cold_code_manager_t *mgr,
+static void manager_record_clear(struct cold_code_manager_impl *manager) {
+    cold_code_memzero(manager, sizeof(*manager));
+}
+
+static void storage_release(struct cold_code_manager_impl *manager) {
+    if (manager->storage != NULL &&
+        manager->storage->owner == (cold_code_manager_t *)manager) {
+        manager->storage->owner = NULL;
+        manager->storage->magic = 0u;
+    }
+}
+
+static void residency_clear(struct cold_code_manager_impl *manager) {
+    if (manager->fast.slot_map != NULL) {
+        for (uint32_t slot = 0; slot < manager->slot_count; ++slot) {
+            manager->fast.slot_map[slot] = 0u;
+        }
+    }
+    if (manager->way_slot != NULL) {
+        for (uint32_t way = 0; way < manager->fast.pool_slots; ++way) {
+            manager->way_slot[way] = COLD_CODE_INVALID_SLOT;
+        }
+    }
+    if (manager->fast.way_used != NULL) {
+        for (uint32_t way = 0; way < manager->fast.pool_slots; ++way) {
+            manager->fast.way_used[way] = 0u;
+        }
+    }
+    manager->fast.tick = 0u;
+    manager->fast.hits = 0u;
+    manager->loads = 0u;
+    manager->evictions = 0u;
+    manager->misses = 0u;
+    manager->faults = 0u;
+}
+
+static cold_code_status_t manager_fail_init(struct cold_code_manager_impl *manager,
+                                            cold_code_status_t status, bool source_opened) {
+    if (source_opened && manager->source_ops != NULL && manager->source_ops->close != NULL) {
+        manager->source_ops->close(manager->source_ctx);
+    }
+    storage_release(manager);
+    manager_record_clear(manager);
+    return status;
+}
+
+static cold_code_status_t verify_payload_crc(struct cold_code_manager_impl *manager,
                                              const cold_code_image_header_t *header,
                                              uint32_t payload_size) {
     unsigned char buffer[COLD_CODE_CRC_CHUNK];
@@ -44,7 +75,8 @@ static cold_code_status_t verify_payload_crc(cold_code_manager_t *mgr,
     while (done < payload_size) {
         uint32_t remaining = payload_size - done;
         size_t chunk = remaining < COLD_CODE_CRC_CHUNK ? (size_t)remaining : COLD_CODE_CRC_CHUNK;
-        if (!mgr->source->read(mgr->source_ctx, header->payload_offset + done, buffer, chunk)) {
+        if (!manager->source_ops->read(manager->source_ctx, header->payload_offset + done, buffer,
+                                       chunk)) {
             return COLD_CODE_ERR_SOURCE;
         }
         crc = cold_code_crc32_update(crc, buffer, chunk);
@@ -57,182 +89,310 @@ static cold_code_status_t verify_payload_crc(cold_code_manager_t *mgr,
     return COLD_CODE_OK;
 }
 
-cold_code_status_t cold_code_manager_init(cold_code_manager_t *mgr, const cold_code_image_t *image,
-                                          const cold_code_config_t *cfg) {
-    if (mgr == NULL || image == NULL || cfg == NULL || cfg->source == NULL ||
-        cfg->source->open == NULL || cfg->source->close == NULL || cfg->source->read == NULL) {
+static cold_code_status_t validate_header(const cold_code_image_header_t *header,
+                                          const cold_code_image_t *image, uint32_t source_size,
+                                          bool verify_crc) {
+    if (header->image_id != image->image_id || header->arch != image->arch ||
+        header->abi_version != image->abi_version || header->slot_size != image->slot_size ||
+        header->slot_count != image->slot_count ||
+        header->max_pool_slots != image->max_pool_slots ||
+        header->payload_offset != COLD_CODE_IMAGE_HEADER_SIZE) {
+        return COLD_CODE_ERR_IMAGE;
+    }
+
+    uint64_t expected_payload = (uint64_t)image->slot_size * (uint64_t)image->slot_count;
+    if (expected_payload > (uint64_t)UINT32_MAX ||
+        (uint64_t)header->payload_size != expected_payload) {
+        return COLD_CODE_ERR_IMAGE;
+    }
+    if ((uint64_t)header->payload_offset + (uint64_t)header->payload_size >
+        (uint64_t)source_size) {
+        return COLD_CODE_ERR_IMAGE;
+    }
+    if (verify_crc && (header->flags & COLD_CODE_IMAGE_FLAG_PAYLOAD_CRC32) == 0u) {
+        return COLD_CODE_ERR_IMAGE;
+    }
+    return COLD_CODE_OK;
+}
+
+cold_code_status_t cold_code_manager_init(cold_code_manager_t *manager,
+                                          const cold_code_manager_config_t *config) {
+    if (manager == NULL || config == NULL || config->image == NULL ||
+        config->storage == NULL || config->storage_size == 0u) {
         return COLD_CODE_ERR_ARG;
     }
-    if (mgr->initialized) {
+
+    struct cold_code_manager_impl *impl = impl_of(manager);
+    if (impl->manager_magic != 0u) {
         return COLD_CODE_ERR_STATE;
     }
-    if (!valid_image_descriptor(image) || !manager_storage_is_bound(mgr) ||
-        mgr->pool_slots != image->pool_slot_count || mgr->storage_slot_count != image->slot_count) {
+
+    const cold_code_image_t *image = config->image;
+    if (!cold_code_image_geometry_valid(image)) {
         return COLD_CODE_ERR_ARG;
     }
-    if (mgr->storage->owner != NULL && mgr->storage->owner != mgr) {
+    if (image->abi_version != COLD_CODE_ABI_VERSION) {
+        return COLD_CODE_ERR_UNSUPPORTED;
+    }
+
+    const cold_code_context_ops_t *ops = cold_code_context_ops_checked();
+    if (ops == NULL || !cold_code_context_arch_valid(ops)) {
+        return COLD_CODE_ERR_UNSUPPORTED;
+    }
+    if (ops->arch != image->arch) {
+        return COLD_CODE_ERR_ARCH;
+    }
+
+    if (config->source.ops == NULL || config->source.ops->open == NULL ||
+        config->source.ops->read == NULL) {
+        return COLD_CODE_ERR_ARG;
+    }
+
+    uint32_t pool_slots = cold_code_resolve_pool_slots(image, config->pool_slots);
+    if (pool_slots == 0u) {
+        return COLD_CODE_ERR_ARG;
+    }
+
+    cold_code_storage_layout_t layout;
+    if (cold_code_storage_layout(image, pool_slots, &layout) != COLD_CODE_OK) {
+        return COLD_CODE_ERR_ARG;
+    }
+    if (config->storage_size < layout.total_size) {
+        return COLD_CODE_ERR_SIZE;
+    }
+    if ((uintptr_t)config->storage % (uintptr_t)image->storage_align != 0u) {
+        return COLD_CODE_ERR_SIZE;
+    }
+
+    cold_code_storage_header_t *storage = (cold_code_storage_header_t *)config->storage;
+    if (storage->magic == 0u) {
+        if (storage->owner != NULL) {
+            return COLD_CODE_ERR_STATE;
+        }
+    } else if (storage->magic != COLD_CODE_STORAGE_MAGIC) {
         return COLD_CODE_ERR_STATE;
-    }
-
-    uint32_t source_size = 0u;
-    if (!cfg->source->open(cfg->source_ctx, &source_size)) {
-        return COLD_CODE_ERR_SOURCE;
-    }
-
-    cold_code_image_header_t header;
-    if (!cfg->source->read(cfg->source_ctx, 0u, &header, sizeof(header))) {
-        cfg->source->close(cfg->source_ctx);
-        return COLD_CODE_ERR_SOURCE;
-    }
-
-    cold_code_status_t status = cold_code_validate_image_header(&header, image, source_size);
-    if (status != COLD_CODE_OK) {
-        cfg->source->close(cfg->source_ctx);
-        return status;
-    }
-
-    uint32_t payload_size = header.slot_count * header.slot_size;
-    mgr->source = cfg->source;
-    mgr->source_ctx = cfg->source_ctx;
-    if (cfg->verify_crc) {
-        status = verify_payload_crc(mgr, &header, payload_size);
-        if (status != COLD_CODE_OK) {
-            cfg->source->close(cfg->source_ctx);
-            mgr->source = NULL;
-            mgr->source_ctx = NULL;
-            return status;
+    } else {
+        if (storage->abi_version != (uint16_t)COLD_CODE_ABI_VERSION ||
+            storage->struct_size < (uint16_t)sizeof(*storage)) {
+            return COLD_CODE_ERR_STATE;
+        }
+        if (storage->owner != NULL && storage->owner != (void *)manager) {
+            return COLD_CODE_ERR_STATE;
         }
     }
 
-    mgr->image = image;
-    mgr->payload_offset = header.payload_offset;
-    mgr->payload_size = payload_size;
-    mgr->verify_crc = cfg->verify_crc;
-    mgr->trace = cfg->trace;
-    mgr->trace_ctx = cfg->trace_ctx;
-    mgr->fatal = cfg->fatal;
-    mgr->fatal_ctx = cfg->fatal_ctx;
-    clear_residency(mgr);
-    mgr->storage->owner = mgr;
-    mgr->initialized = true;
+    unsigned char *base = (unsigned char *)config->storage;
+    storage->owner = manager;
+    storage->magic = COLD_CODE_STORAGE_MAGIC;
+    storage->abi_version = (uint16_t)COLD_CODE_ABI_VERSION;
+    storage->struct_size = (uint16_t)sizeof(*storage);
+    storage->image_id = image->image_id;
+    storage->slot_count = image->slot_count;
+    storage->pool_slots = pool_slots;
+    storage->total_size = (uint32_t)layout.total_size;
+
+    impl->fast.image = image;
+    impl->fast.slot_map = (uint32_t *)(base + layout.slot_map_offset);
+    impl->fast.way_used = (uint64_t *)(base + layout.way_used_offset);
+    impl->fast.pool = base + layout.pool_offset;
+    impl->fast.pool_slots = pool_slots;
+    impl->fast.state = 0u;
+    impl->way_slot = (uint32_t *)(base + layout.way_slot_offset);
+    impl->storage = storage;
+    impl->source_ops = config->source.ops;
+    impl->source_ctx = config->source.ctx;
+    impl->slot_count = image->slot_count;
+    impl->trace = config->trace;
+    impl->fault = config->fault;
+    impl->flags = config->flags;
+    residency_clear(impl);
+
+    uint32_t source_size = 0u;
+    if (!impl->source_ops->open(impl->source_ctx, &source_size)) {
+        return manager_fail_init(impl, COLD_CODE_ERR_SOURCE, false);
+    }
+
+    unsigned char header_bytes[COLD_CODE_IMAGE_HEADER_SIZE];
+    if (!impl->source_ops->read(impl->source_ctx, 0u, header_bytes, sizeof(header_bytes))) {
+        return manager_fail_init(impl, COLD_CODE_ERR_SOURCE, true);
+    }
+
+    cold_code_image_header_t header;
+    cold_code_status_t status =
+        cold_code_image_header_decode(header_bytes, sizeof(header_bytes), &header);
+    if (status != COLD_CODE_OK) {
+        return manager_fail_init(impl, COLD_CODE_ERR_IMAGE, true);
+    }
+
+    bool verify_crc = (config->flags & COLD_CODE_INIT_VERIFY_CRC) != 0u;
+    status = validate_header(&header, image, source_size, verify_crc);
+    if (status != COLD_CODE_OK) {
+        return manager_fail_init(impl, status, true);
+    }
+
+    if (verify_crc) {
+        status = verify_payload_crc(impl, &header, header.payload_size);
+        if (status != COLD_CODE_OK) {
+            return manager_fail_init(impl, status, true);
+        }
+    }
+
+    impl->payload_offset = header.payload_offset;
+    impl->payload_size = header.payload_size;
+    impl->manager_magic = COLD_CODE_MANAGER_MAGIC;
+    impl->fast.state = COLD_CODE_MANAGER_STATE_READY;
     return COLD_CODE_OK;
 }
 
-void cold_code_manager_deinit(cold_code_manager_t *mgr) {
-    if (mgr == NULL || !mgr->initialized) {
-        return;
-    }
-
-    if (mgr->source != NULL && mgr->source->close != NULL) {
-        mgr->source->close(mgr->source_ctx);
-    }
-    if (mgr->storage != NULL && mgr->storage->owner == mgr) {
-        mgr->storage->owner = NULL;
-    }
-    if (cold_code_port_current() == mgr) {
-        cold_code_port_set_current(NULL);
-    }
-
-    mgr->initialized = false;
-    mgr->image = NULL;
-    mgr->source = NULL;
-    mgr->source_ctx = NULL;
-    mgr->payload_offset = 0u;
-    mgr->payload_size = 0u;
-    mgr->trace = NULL;
-    mgr->trace_ctx = NULL;
-    mgr->fatal = NULL;
-    mgr->fatal_ctx = NULL;
-}
-
-cold_code_status_t cold_code_manager_reset(cold_code_manager_t *mgr) {
-    if (mgr == NULL || !mgr->initialized || mgr->image == NULL) {
+cold_code_status_t cold_code_manager_deinit(cold_code_manager_t *manager) {
+    if (manager == NULL) {
         return COLD_CODE_ERR_ARG;
     }
-    clear_residency(mgr);
+    struct cold_code_manager_impl *impl = impl_of(manager);
+    if (!manager_is_ready(impl)) {
+        return COLD_CODE_ERR_STATE;
+    }
+
+    const cold_code_context_ops_t *ops = cold_code_context_ops_checked();
+    if (ops != NULL && ops->current() == manager) {
+        ops->set_current(NULL);
+    }
+
+    if (impl->source_ops != NULL && impl->source_ops->close != NULL) {
+        impl->source_ops->close(impl->source_ctx);
+    }
+    storage_release(impl);
+    manager_record_clear(impl);
     return COLD_CODE_OK;
 }
 
-void cold_code_manager_use(cold_code_manager_t *mgr) {
-    if (mgr != NULL && !mgr->initialized) {
-        cold_code_port_fatal("cold_code: cold_code_manager_use() got an uninitialised manager");
-    }
-    cold_code_port_set_current(mgr);
-}
-
-cold_code_manager_t *cold_code_manager_current(void) {
-    return cold_code_port_current();
-}
-
-cold_code_status_t cold_code_manager_stats(const cold_code_manager_t *mgr, cold_code_stats_t *out) {
-    if (mgr == NULL || out == NULL || !mgr->initialized || mgr->image == NULL) {
+cold_code_status_t cold_code_manager_reset(cold_code_manager_t *manager) {
+    if (manager == NULL) {
         return COLD_CODE_ERR_ARG;
+    }
+    struct cold_code_manager_impl *impl = impl_of(manager);
+    if (!manager_is_ready(impl)) {
+        return COLD_CODE_ERR_STATE;
+    }
+    residency_clear(impl);
+    return COLD_CODE_OK;
+}
+
+bool cold_code_manager_is_initialized(const cold_code_manager_t *manager) {
+    return manager != NULL && manager_is_ready(impl_of_const(manager));
+}
+
+cold_code_status_t cold_code_manager_stats(const cold_code_manager_t *manager,
+                                           cold_code_stats_t *out) {
+    if (manager == NULL || out == NULL) {
+        return COLD_CODE_ERR_ARG;
+    }
+    const struct cold_code_manager_impl *impl = impl_of_const(manager);
+    if (!manager_is_ready(impl)) {
+        return COLD_CODE_ERR_STATE;
     }
 
     uint32_t loaded = 0u;
-    for (uint32_t way = 0; way < mgr->pool_slots; ++way) {
-        if (mgr->way_slot[way] != COLD_CODE_INVALID_SLOT) {
+    for (uint32_t way = 0; way < impl->fast.pool_slots; ++way) {
+        if (impl->way_slot[way] != COLD_CODE_INVALID_SLOT) {
             ++loaded;
         }
     }
 
-    cold_code_stats_t stats = mgr->stats;
-    stats.image_slots = mgr->image->slot_count;
-    stats.pool_slots = mgr->image->pool_slot_count;
-    stats.loaded_slots = loaded;
-    *out = stats;
+    out->image_slots = impl->fast.image->slot_count;
+    out->pool_slots = impl->fast.pool_slots;
+    out->loaded_slots = loaded;
+    out->loads = impl->loads;
+    out->evictions = impl->evictions;
+    out->hits = impl->fast.hits;
+    out->misses = impl->misses;
+    out->faults = impl->faults;
     return COLD_CODE_OK;
 }
 
-_Noreturn void cold_code_manager_fatal(const cold_code_manager_t *mgr, const char *message) {
-    if (mgr != NULL && mgr->fatal != NULL) {
-        mgr->fatal(mgr->fatal_ctx, message);
-        cold_code_port_abort();
+const cold_code_image_t *cold_code_manager_image(const cold_code_manager_t *manager) {
+    if (manager == NULL) {
+        return NULL;
     }
-    cold_code_port_fatal(message);
+    const struct cold_code_manager_impl *impl = impl_of_const(manager);
+    return manager_is_ready(impl) ? impl->fast.image : NULL;
 }
 
-/*
- * Make the image slot resident and return the base address of its physical
- * slot.  Every generated stub calls this before tail-jumping into the cold
- * function, so a hit also refreshes the LRU timestamp.
- *
- * The current manager is thread-local.  Managers never share mutable state,
- * so no lock or pin is needed; a cold function cannot evict its own slot
- * because cross-slot direct calls are rejected at build time.
- */
-unsigned char *cold_code_acquire_slot(uint32_t image_id, uint32_t image_slot) {
-    cold_code_manager_t *mgr = cold_code_port_current();
-    if (mgr == NULL || !mgr->initialized || mgr->image == NULL) {
-        cold_code_port_fatal("cold_code: no current manager; call "
-                             "cold_code_manager_use() before calling cold code");
+void *cold_code_manager_pool_base(const cold_code_manager_t *manager) {
+    if (manager == NULL) {
+        return NULL;
+    }
+    const struct cold_code_manager_impl *impl = impl_of_const(manager);
+    return manager_is_ready(impl) ? impl->fast.pool : NULL;
+}
+
+uint32_t cold_code_manager_pool_slots(const cold_code_manager_t *manager) {
+    if (manager == NULL) {
+        return 0u;
+    }
+    const struct cold_code_manager_impl *impl = impl_of_const(manager);
+    return manager_is_ready(impl) ? impl->fast.pool_slots : 0u;
+}
+
+cold_code_status_t cold_code_manager_activate(cold_code_manager_t *manager) {
+    const cold_code_context_ops_t *ops = cold_code_context_ops_checked();
+    if (ops == NULL || !cold_code_context_arch_valid(ops)) {
+        return COLD_CODE_ERR_UNSUPPORTED;
+    }
+    if (manager != NULL && !manager_is_ready(impl_of(manager))) {
+        return COLD_CODE_ERR_STATE;
+    }
+    ops->set_current(manager);
+    return COLD_CODE_OK;
+}
+
+cold_code_manager_t *cold_code_manager_current(void) {
+    const cold_code_context_ops_t *ops = cold_code_context_ops_checked();
+    return ops != NULL ? ops->current() : NULL;
+}
+
+unsigned char *cold_code_core_acquire_slot_v1(const cold_code_image_t *image,
+                                              uint32_t image_slot) {
+    const cold_code_context_ops_t *ops = cold_code_context_ops_checked();
+    if (ops == NULL) {
+        cold_code_core_fatal(NULL, COLD_CODE_FAULT_CORRUPT_STATE, image_slot,
+                             "cold_code: context port is not available");
     }
 
-    if (mgr->image->image_id != image_id) {
-        cold_code_manager_fatal(mgr, "cold_code: current manager belongs to a different image");
+    struct cold_code_manager_impl *manager =
+        (struct cold_code_manager_impl *)ops->current();
+    if (manager == NULL || !manager_is_ready(manager)) {
+        cold_code_core_fatal(NULL, COLD_CODE_FAULT_NO_CURRENT, image_slot,
+                             "cold_code: no current manager; call "
+                             "cold_code_manager_activate() before calling cold code");
     }
-    if (image_slot >= mgr->image->slot_count) {
-        cold_code_manager_fatal(mgr, "cold_code: invalid image slot");
+    if (manager->fast.image != image) {
+        cold_code_core_fatal(manager, COLD_CODE_FAULT_WRONG_IMAGE, image_slot,
+                             "cold_code: current manager belongs to a different image");
+    }
+    if (image_slot >= manager->slot_count) {
+        cold_code_core_fatal(manager, COLD_CODE_FAULT_BAD_SLOT, image_slot,
+                             "cold_code: invalid image slot");
     }
 
-    uint32_t slot_size = mgr->image->slot_size;
-    uint32_t way_plus = mgr->slot_map[image_slot];
-
+    uint32_t slot_size = image->slot_size;
+    uint32_t way_plus = manager->fast.slot_map[image_slot];
     if (way_plus != 0u) {
-        if (way_plus > mgr->pool_slots) {
-            cold_code_manager_fatal(mgr, "cold_code: corrupt slot map");
+        if (way_plus > manager->fast.pool_slots) {
+            cold_code_core_fatal(manager, COLD_CODE_FAULT_CORRUPT_STATE, image_slot,
+                                 "cold_code: corrupt slot map");
         }
         uint32_t way = way_plus - 1u;
-        mgr->way_used[way] = ++mgr->tick;
-        ++mgr->stats.hits;
-        return mgr->pool + (size_t)way * slot_size;
+        manager->fast.way_used[way] = ++manager->fast.tick;
+        ++manager->fast.hits;
+        return manager->fast.pool + (size_t)way * slot_size;
     }
 
-    ++mgr->stats.misses;
+    ++manager->misses;
 
     uint32_t free_way = COLD_CODE_INVALID_WAY;
-    for (uint32_t way = 0; way < mgr->pool_slots; ++way) {
-        if (mgr->way_slot[way] == COLD_CODE_INVALID_SLOT) {
+    for (uint32_t way = 0; way < manager->fast.pool_slots; ++way) {
+        if (manager->way_slot[way] == COLD_CODE_INVALID_SLOT) {
             free_way = way;
             break;
         }
@@ -241,36 +401,50 @@ unsigned char *cold_code_acquire_slot(uint32_t image_id, uint32_t image_slot) {
     uint32_t way = free_way;
     if (way == COLD_CODE_INVALID_WAY) {
         uint64_t oldest = UINT64_MAX;
-        for (uint32_t candidate = 0; candidate < mgr->pool_slots; ++candidate) {
-            if (mgr->way_used[candidate] < oldest) {
-                oldest = mgr->way_used[candidate];
+        for (uint32_t candidate = 0; candidate < manager->fast.pool_slots; ++candidate) {
+            if (manager->fast.way_used[candidate] < oldest) {
+                oldest = manager->fast.way_used[candidate];
                 way = candidate;
             }
         }
         if (way == COLD_CODE_INVALID_WAY) {
-            cold_code_manager_fatal(mgr, "cold_code: no LRU victim available");
+            cold_code_core_fatal(manager, COLD_CODE_FAULT_NO_VICTIM, image_slot,
+                                 "cold_code: no LRU victim available");
         }
 
-        uint32_t old_slot = mgr->way_slot[way];
-        mgr->slot_map[old_slot] = 0u;
-        ++mgr->stats.evictions;
-        if (mgr->trace != NULL) {
-            mgr->trace(mgr->trace_ctx, COLD_CODE_TRACE_EVICT, old_slot, way);
+        uint32_t old_slot = manager->way_slot[way];
+        if (old_slot >= manager->slot_count) {
+            cold_code_core_fatal(manager, COLD_CODE_FAULT_CORRUPT_STATE, image_slot,
+                                 "cold_code: corrupt way table");
+        }
+        manager->fast.slot_map[old_slot] = 0u;
+        ++manager->evictions;
+        if (manager->trace.fn != NULL) {
+            manager->trace.fn(manager->trace.ctx, COLD_CODE_TRACE_EVICT, old_slot, way);
         }
     }
 
-    if (!mgr->source->read(mgr->source_ctx, mgr->payload_offset + image_slot * slot_size,
-                           mgr->pool + (size_t)way * slot_size, slot_size)) {
-        cold_code_manager_fatal(mgr, "cold_code: failed to read image slot");
+    unsigned char *target = manager->fast.pool + (size_t)way * slot_size;
+    uint64_t source_offset =
+        (uint64_t)manager->payload_offset + (uint64_t)image_slot * (uint64_t)slot_size;
+    if (source_offset > (uint64_t)UINT32_MAX ||
+        !manager->source_ops->read(manager->source_ctx, (uint32_t)source_offset, target,
+                                   slot_size)) {
+        cold_code_core_fatal(manager, COLD_CODE_FAULT_SOURCE_READ, image_slot,
+                             "cold_code: failed to read image slot");
     }
 
-    mgr->way_slot[way] = image_slot;
-    mgr->slot_map[image_slot] = way + 1u;
-    mgr->way_used[way] = ++mgr->tick;
-    ++mgr->stats.loads;
-    if (mgr->trace != NULL) {
-        mgr->trace(mgr->trace_ctx, COLD_CODE_TRACE_LOAD, image_slot, way);
+    if (ops->sync_code != NULL) {
+        ops->sync_code(target, slot_size);
     }
 
-    return mgr->pool + (size_t)way * slot_size;
+    manager->way_slot[way] = image_slot;
+    manager->fast.slot_map[image_slot] = way + 1u;
+    manager->fast.way_used[way] = ++manager->fast.tick;
+    ++manager->loads;
+    if (manager->trace.fn != NULL) {
+        manager->trace.fn(manager->trace.ctx, COLD_CODE_TRACE_LOAD, image_slot, way);
+    }
+
+    return target;
 }

@@ -4,8 +4,10 @@
 示例:
     ./tool/init.py                      # 更新 CMake 编译数据库与 .vscode/ 配置
     ./tool/init.py --project myproj     # 初始化或重命名项目为 myproj
-    ./tool/init.py --module mylib       # 初始化或重命名模块为 mylib
     ./tool/init.py --skip-configure     # 只更新 .vscode/ 配置
+
+注意: v3 库目录不是传统的 <name>/include/<name>.h 模板结构，因此不再支持
+      --module 重命名；请直接编辑 CMake target 名称。
 """
 
 from __future__ import annotations
@@ -351,7 +353,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "示例:\n"
             "  ./tool/init.py                     # 更新编译数据库与 .vscode/ 配置\n"
             "  ./tool/init.py --project myproj    # 初始化或重命名项目\n"
-            "  ./tool/init.py --module mylib      # 初始化或重命名模块\n"
             "  ./tool/init.py --skip-configure    # 只更新 .vscode/ 配置"
         ),
     )
@@ -360,12 +361,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--project",
         metavar="NAME",
         help="指定项目名称；用于首次初始化或重命名项目",
-    )
-    parser.add_argument(
-        "-m",
-        "--module",
-        metavar="NAME",
-        help="指定库名称；用于首次初始化或重命名已有模块",
     )
     parser.add_argument(
         "--skip-configure",
@@ -382,15 +377,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         rename_project(current_project, project)
     else:
         log(f"当前项目名称: {current_project}")
-
-    current = detect_module_name()
-    name = args.module if args.module is not None else prompt_module_name(current)
-    validate_module_name(name, current)
-
-    if name != current:
-        rename_module(current, name)
-    else:
-        log(f"当前库名称: {current}")
 
     configure_cmake(args.skip_configure)
     generate_vscode_configs()

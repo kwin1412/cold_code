@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reject the same global cold function name in two images of one target."""
+"""Reject the same global cold function/image id in two images of one target."""
 
 from __future__ import annotations
 
@@ -29,8 +29,10 @@ def main(argv: list[str]) -> int:
                     try:
                         image_id = int(parts[4], 16)
                     except ValueError:
-                        print(f"check_duplicate_symbols: error: bad image id line in {path}: {line}",
-                              file=sys.stderr)
+                        print(
+                            f"check_duplicate_symbols: error: bad image id line in {path}: {line}",
+                            file=sys.stderr,
+                        )
                         return 1
                     previous = image_ids.get(image_id)
                     if previous is not None and previous != path:

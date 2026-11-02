@@ -5,25 +5,22 @@
 #include <time.h>
 
 #include "cold_code.h"
-#include "port_host.h"
+#include "cold_code_host.h"
 
 #if BENCH_FAST
 #include "cold_code_bench_fast_image.h"
 #define BENCH_IMAGE     cold_code_image_bench_fast
 #define BENCH_PATH      COLD_CODE_IMAGE_BENCH_FAST_PATH
-#define BENCH_STORAGE_T cold_code_storage_bench_fast_t
-#define BENCH_BIND      cold_code_storage_bench_fast_bind
 #define BENCH_LABEL     "fast"
+COLD_CODE_DEFINE_STORAGE(bench_fast, g_storage);
 #else
 #include "cold_code_bench_slow_image.h"
 #define BENCH_IMAGE     cold_code_image_bench_slow
 #define BENCH_PATH      COLD_CODE_IMAGE_BENCH_SLOW_PATH
-#define BENCH_STORAGE_T cold_code_storage_bench_slow_t
-#define BENCH_BIND      cold_code_storage_bench_slow_bind
 #define BENCH_LABEL     "slow"
+COLD_CODE_DEFINE_STORAGE(bench_slow, g_storage);
 #endif
 
-static BENCH_STORAGE_T g_storage COLD_CODE_STORAGE_SECTION;
 static cold_code_manager_t g_manager;
 
 int cold_lru_add(int lhs, int rhs);
@@ -39,24 +36,28 @@ static uint64_t now_ns(void) {
 
 int main(int argc, char **argv) {
     const char *path = argc > 1 ? argv[1] : BENCH_PATH;
-    cold_code_file_source_t source;
-    cold_code_file_source_init(&source, path);
-    BENCH_BIND(&g_manager, &g_storage);
+    cold_code_file_source_t file;
+    cold_code_file_source_init(&file, path);
 
-    cold_code_config_t config = {
-        .source = &cold_code_file_source_ops,
-        .source_ctx = &source,
+    cold_code_manager_config_t config = {
+        .image = &BENCH_IMAGE,
+        .storage = &g_storage,
+        .storage_size = sizeof(g_storage),
+        .pool_slots = 1u,
+        .source = cold_code_file_source(&file),
+        .flags = COLD_CODE_INIT_VERIFY_CRC,
     };
-    if (cold_code_manager_init(&g_manager, &BENCH_IMAGE, &config) != COLD_CODE_OK) {
+    if (cold_code_manager_init(&g_manager, &config) != COLD_CODE_OK) {
         fprintf(stderr, "manager init failed\n");
         return 1;
     }
-    cold_code_manager_use(&g_manager);
+    if (cold_code_manager_activate(&g_manager) != COLD_CODE_OK) {
+        return 1;
+    }
 
     const int iterations = 2000000;
     volatile long sink = 0;
 
-    /* Warm slot 0. */
     sink += cold_lru_add(1, 2);
 
     uint64_t start = now_ns();
@@ -65,7 +66,6 @@ int main(int argc, char **argv) {
     }
     uint64_t hit_ns = now_ns() - start;
 
-    /* With POOL_SLOTS=1, alternating slot 0 and slot 2 forces a miss/load. */
     start = now_ns();
     for (int i = 0; i < iterations; ++i) {
         sink += cold_lru_add(1, 2);

@@ -1,245 +1,225 @@
 # AGENTS.md
 
-本文件面向在本仓库中工作的编码 agent。设计细节以 `README.md` 为准；这里只列
-必须知道的约定、命令和约束。
+本文件面向在本仓库中工作的编码 agent。设计细节以 `README.md` 和 `docs/` 为准；
+这里只列必须知道的约定、命令和约束。
 
 ## 项目概述
 
-- `cold_code/` 是**平台无关的 C17 核心 + port 契约**：冷函数编译进独立 flat image
-  （模拟 flash），热端只有自动生成的 x86-64 stub；首次执行按 slot 载入静态 RWX RAM，
-  并用 slot 级 LRU 管理换入换出。宿主 port/source 是 example 中的参考实现，不属库。
-- v2 运行时是**多 manager** 模型：同一份 image 可由多个 manager 使用，每个 manager
-  有独立的 storage/pool/LRU/stats；执行上下文（宿主线程或嵌入式 CPU/core/task）通过
-  `cold_code_manager_use()` 选择自己的 manager。
-- 不同执行上下文使用不同 manager，无共享可变状态、无锁、无 pin；同一 manager 必须只由
-  一个执行上下文使用。同一 image slot 会被不同 manager 加载到不同物理 pool 地址。
-- 核心 loader 不调用 OS 动态加载接口（无 `dlopen`、`mmap`/`mprotect` 按需分页、
-  `SIGSEGV`、`userfaultfd`）；宿主 port 仅用文件/内存读取模拟 flash。
-- `example/` 是仓库内消费者；`tests/` 是 CTest 测试套件；`tool/` 只保留通用模板
-  工具（`init.py`、`vscode/`）。
+- `cold_code/` 是平台无关的 C17 冷代码加载库 + port 契约。冷函数编译进独立 flat
+  image（模拟 flash/ROM），热端只有生成的 x86-64 stub；首次执行按 slot 载入静态
+  RWX RAM，并用 slot 级 LRU 管理换入换出。
+- v3 是 breaking redesign：
+  - `cold_code::core` 是 freestanding loader，不依赖 port 实现。
+  - manager 不透明；storage 由调用方显式提供，core 内部切分。
+  - `cold_code::host`（TLS/file source/x86-64 fast accessor）和
+    `cold_code::baremetal`（per-core/cache hooks，无 libc）是可复用 port，
+    core 不依赖它们。
+  - 一个 executable 只能链接一个 context port（`cold_code_context_ops`）。
+- 每执行上下文（宿主线程或嵌入式 CPU/core/task）使用独立 manager；不同 manager
+  无共享可变状态、无锁、无 pin。同一 manager 只能由一个执行上下文使用。
+- 核心 loader 不调用 OS 动态加载接口（无 `dlopen`、按需分页、`SIGSEGV`、
+  `userfaultfd`）；host port 只用文件/内存读取模拟 flash。
 
 ## 快速命令
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build -j
-ctest --test-dir build --output-on-failure
+ctest --test-dir build --output-on-failure        # 26 个测试
 ctest --test-dir build -R cold_code --output-on-failure
 ./build/example/example
+./build/tests/bench_fast
+./build/tests/bench_slow
 ```
 
-- 测试默认随 `BUILD_TESTING=ON`（CTest 默认）构建；可用
-  `-DBUILD_TESTING=OFF` 只构建库和示例。
-- `-j` 可并行构建；CTest 测试默认串行执行。
+- 根项目只启用 `LANGUAGES C`；`cold_code` 库/helper 自动 `enable_language(ASM)`。
+- `-DBUILD_TESTING=OFF` 只构建库和 example；`-DCOLD_CODE_BUILD_EXAMPLE=OFF`
+  跳过 example。
+- 安装消费：`cmake --install build --prefix /tmp/cold-code`，再用
+  `find_package(cold_code 3 CONFIG REQUIRED)`。
 
 ## 目录
 
 ```text
-cold_code/           平台无关核心 + port 契约
-  CMakeLists.txt     cold_code_core + port/fast interfaces + COLD_CODE_HELPER
-  cmake/             cold_code_add_image() helper
-  include/           核心公共 API（cold_code.h）
-  port/include/      port 接口契约（cold_code_port.h）
-  arch/x86_64/       FAST_PATH accessor 契约 + layout + 编译期检查
-  src/core/          manager + image + internal header
-  linker/            cold_image.ld / cold_ram.ld
-  tool/              gen_cold_code.py / verify_cold_ram.py / check_duplicate_symbols.py
-example/             消费者 + 参考宿主 port（port_host.c/.h + fast .S）
-tests/               CTest 测试、负向 fixture、测试用 host port（support/）、benchmark
-tests/consumer/      独立 consumer + 自带 host port + fast accessor
-tool/                通用模板工具（init.py、vscode/）
+cold_code/
+  include/cold_code.h                  umbrella 公共 API
+  include/cold_code/                   分模块公共头（image/storage/manager/...）
+  src/core/                            freestanding loader（无 libc/port）
+  src/port/host/                       cold_code::host（TLS/file/fast x86-64）
+  src/port/baremetal/                  cold_code::baremetal（per-core）
+  src/arch/x86_64/                     fast-state offset 头 + _Static_assert
+  tool/gen_cold_code.py                arch-agnostic 生成器
+  tool/arch/                           x86_64 backend；其它 arch 仅接口
+  tool/host/verify_rwx.py              host RWX/storage 校验
+  cmake/ColdCodeImage.cmake            cold_code_add_image()
+  cmake/cold_code-config.cmake.in      install/find_package 配置
+  linker/x86_64/                       flat image + host .cold_ram
+example/                               最小消费者，链接 cold_code::host
+tests/                                 CTest、负向 fixture、consumer、benchmark
+tool/                                  init.py / vscode 模板
+docs/                                  porting / internals / migration
 ```
 
-- `cold_code_core` 只含 `src/core/`，不定义 `cold_code_port_*`，也不含 source 实现。
-- 库只提供 port 契约头 `cold_code_port.h`；port 和文件/内存 source 由每个 executable
-  自己提供（example/port_host.c 是宿主参考）。
-- `tests/support/port_host.c` 是测试 harness 的 host port；`test_custom_port` 故意
-  不链接它。
+## 硬性约束
 
-## 架构与硬性约束
+- **每个冷函数必须完整落在一个 slot 内**；生成器拒绝跨 slot 函数。
+- **禁止跨 slot 冷函数直接调用**；同 slot 内允许。构建期检查。
+- 冷函数必须自包含：不能引用 libc/外部符号、静态数据、字符串字面量、jump table；
+  冷镜像链接脚本会丢弃这些 section。
+- 全局冷函数名在一个 executable 内唯一；同一 target 多个 image 由 helper 检查。
+- 冷镜像 slot 分配仍依赖链接顺序；不要假设跨编译器稳定。
+- image/stub 是受信可执行代码；CRC 只检测损坏，不是签名/认证。
+- **每个 manager 单执行上下文使用**；不同上下文不同 manager；同一 manager 并发使用
+  是 UB。库不加锁、不 pin。
+- 一个 storage 同一时刻只属于一个 manager；deinit 后释放。storage 必须放在可执行
+  RAM（host 用 `COLD_CODE_DEFINE_STORAGE`/`.cold_ram`）。
+- 冷函数执行期间不要通过热端回调重入其他 slot 的冷代码；同 slot 互调安全。
+- 消费方必须使用生成的 descriptor 对象（`cold_code_image_<name>`）；运行时比较
+  descriptor 指针身份，复制 descriptor 会导致冷调用 fault。
+- 一个 executable 只能链接一个 context port；host + baremetal 同时链接会 duplicate
+  `cold_code_context_ops`。
+- FAST_PATH 当前仅 x86-64；baremetal 本期用 slow stub。
 
-- 冷函数用 `COLD_CODE()` 标注；热端用普通声明/调用，不出现句柄或显式 load。
-- **每个函数必须完整落在一个 slot 内**；生成器会拒绝跨 slot 的函数。
-- **禁止跨 slot 冷函数直接调用**；同 slot 内允许。构建期会检查。
-- 冷函数必须自包含：不能引用 libc/外部符号、静态数据、字符串字面量或 jump
-  table；冷镜像链接脚本会丢弃这些 section。
-- **全局冷函数名在一个可执行文件内唯一**；同一 target 的多个 image 由 helper 在链接前
-  检查重复符号。
-- 消费方顶层必须启用 ASM（`project(... LANGUAGES C ASM)`），因为生成的
-  `cold_code_<name>_stubs.S` 会编译进 consumer target。
-- 消费方必须提供自己的平台 port（参考 `example/port_host.c`）：
-  ```cmake
-  add_subdirectory(path/to/cold_code cold_code)
-  include("${COLD_CODE_HELPER}")
-  add_executable(app main.c app_port.c)   # app_port 实现 cold_code_port.h
-  target_link_libraries(app PRIVATE cold_code_core)
-  cold_code_add_image(app NAME app SOURCES cold/app_cold.c SLOT_SIZE 64 POOL_SLOTS 1)
-  ```
-  一个 executable 只链接一个 port；嵌入式 port 实现自己的 current manager/fatal/source。
-  可选 `cold_code_add_image(... FAST_PATH ON)` 需要 port 额外提供 x86-64
-  `cold_code_port_current_fast`；不提供时保持默认 slow stub。
-- 库只提供 port 契约 `cold_code_port.h`；宿主文件/内存 source 的参考实现在
-  `example/port_host.c/.h`，测试 harness 在 `tests/support/`。只使用核心 API 时
-  include `cold_code.h`。
-- 核心库保留未解析的 `cold_code_port_*` 符号；只链接 `cold_code_core` 而不提供
-  port 会在链接期报 undefined。
-- FAST_PATH 是可选 x86-64 特性：`cold_code_add_image(... FAST_PATH ON)` 生成命中
-  内联 stub，并额外要求 port 提供 `cold_code_port_current_fast`（私有 ABI，见
-  `cold_code/arch/x86_64/cold_code_port_fast.h`）。默认 OFF；自定义/嵌入式 port 可只
-  支持 slow stub。`cold_code/arch/x86_64/cold_code_fast_layout.h` 的 offset 由生成器
-  读取，并由 `fast_layout_check.c` 的 `_Static_assert` 校验。
-- 测试矩阵：`cold_code.basic` 用 slow stub；其余 host-based 测试/example/consumer 用
-  FAST_PATH ON；`test_custom_port` 提供自己的 per-CPU fast accessor。
-- `NAME` 必填、必须是 C 标识符，且在同一 target 内唯一。同一 target 多个 image 时
-  分别传不同的 `OUTPUT_DIR`（默认已包含 target+name）。
-- 每个 image 生成独立 descriptor/storage 类型/stub，符号带 `NAME` 命名空间；同一
-  target 可包含多个 image。
-- 运行时是**无 function ID**的 slot 级 LRU；stub 携带 image_id + image slot + intra
-  offset。stub 会校验当前 manager 的 image_id，防止执行上下文用错 image。
-- 每个 manager 单执行上下文使用；线程/CPU 间使用不同 manager（同一 image 可多 manager）。
-  不 pin 正在执行的 slot，不加锁；同一 manager 并发使用是未定义行为。
-- 一个 storage 同一时刻只能属于一个 manager（生成的 storage 带 owner header）；
-  第二个 manager init 返回 `COLD_CODE_ERR_STATE`，deinit 释放后才能复用。
-- host 的 current manager 用线程 TLS；嵌入式 port 可改为 per-core 表或 task-local。
-  per-core manager 被同 core 多 task 共享时，冷代码必须协作式执行，否则用 task-local。
-- 冷函数执行期间不要通过热端回调/函数指针重入其他 slot 的冷代码；loader 不 pin
-  当前 slot，重入可能覆盖正在执行的代码。同 slot 内直接互调安全。
-- 宿主上的 storage/pool 位于静态 RWX 段；`verify_cold_ram.py` 在 POST_BUILD 检查
-  每个 image 的 `cold_code_ram_marker_<name>`。
-- 生成的 map 文件位于各 `OUTPUT_DIR`：`cold_image_<name>.map`、
-  `cold_code_<name>_layout.map`、`cold_code_<name>_symbols.txt`；热端 `<target>.map`
-  在当前二进制目录。
-
-## 新增冷函数/冷镜像
+## 公共 API 使用模式
 
 ```c
 #include "cold_code.h"
+#include "cold_code_app_image.h"
+#include "cold_code_host.h"          /* 或 cold_code_baremetal.h / 自定义 port */
 
-COLD_CODE()
-int app_cold_add(int lhs, int rhs) {
-    return lhs + rhs;
-}
+COLD_CODE_DEFINE_STORAGE(app, g_storage);
+static cold_code_manager_t g_manager;
+
+cold_code_manager_config_t cfg = {
+    .image = &cold_code_image_app,
+    .storage = &g_storage,
+    .storage_size = sizeof(g_storage),
+    .pool_slots = 2,                 /* 0 => 生成上限 */
+    .source = cold_code_file_source(&file),
+    .flags = COLD_CODE_INIT_VERIFY_CRC,
+    .trace = {.fn = trace_event, .ctx = NULL},
+    .fault = {.fn = fault_event, .ctx = NULL},
+};
+cold_code_manager_init(&g_manager, &cfg);
+cold_code_manager_activate(&g_manager);
+int r = cold_code_add(2, 3);
+cold_code_manager_activate(NULL);
+cold_code_manager_deinit(&g_manager);
 ```
 
-1. 冷源文件用 `COLD_CODE()`；热端写普通原型并直接调用。
-2. 在 consumer `CMakeLists.txt` 中调用
-   `cold_code_add_image(app NAME app SOURCES ... SLOT_SIZE 64 POOL_SLOTS 1)`；
-   需要时用 `__attribute__((aligned(SLOT_SIZE)))` 避免函数跨 slot。
-3. 调用方为每个 manager 静态声明一份**独立**、零初始化的生成 storage（含 owner header）：
-   ```c
-   #include "cold_code_app_image.h"
-   #include "port_host.h" /* 你的平台 port/source（参考 example/port_host.h） */
-   static cold_code_storage_app_t storage COLD_CODE_STORAGE_SECTION;
-   static cold_code_manager_t manager; /* 零初始化 */
-   static cold_code_file_source_t source;
+- `cold_code_manager_init` 校验 image geometry/ABI/arch、context port、storage
+  size/alignment/owner、v3 header/CRC；失败回滚 storage owner。
+- 所有生命周期 API 返回 `cold_code_status_t`（`deinit/reset/stats` 也是）。
+- 运行时 fault 调用 manager fault callback，再调用 context port `fatal`（不得返回）。
+- source：`open`/`read` 必需，`close` 可选；core 提供 memory source。
+- storage 尺寸统一用 `COLD_CODE_STORAGE_SIZE(slot_count, pool_slots, slot_size, align)`。
+- introspection：`cold_code_manager_image/pool_base/pool_slots/is_initialized`。
 
-   cold_code_file_source_init(&source, COLD_CODE_IMAGE_APP_PATH);
-   cold_code_storage_app_bind(&manager, &storage);
-   cold_code_config_t config = {
-       .source = &cold_code_file_source_ops,
-       .source_ctx = &source,
-       .verify_crc = true,
-   };
-   cold_code_manager_init(&manager, &cold_code_image_app, &config);
-   cold_code_manager_use(&manager);
-   ```
-4. 调试时给 config 设置 `trace` 回调（`cold_code_trace_event_t`），打印 load/evict
-   行；`cold_code_manager_stats()` 读取每 manager 统计。
-5. 多执行上下文：每个线程/CPU 的代码 `cold_code_manager_use()` 自己的 manager；
-   不要共享 manager 或 storage。同一 image 多 manager 时共享只读 image/source，
-   但 storage/pool 必须各自独立。
+## 生成/CMake
+
+```cmake
+add_executable(app main.c)
+target_link_libraries(app PRIVATE cold_code::host)   # 或 baremetal
+cold_code_add_image(app
+    NAME app
+    SOURCES cold/app_cold.c
+    SLOT_SIZE 64
+    POOL_SLOTS 2
+    STUBS FAST            # 或 SLOW；FAST_PATH ON 是兼容别名
+    DEFINE_PATH ON
+)
+```
+
+- `NAME` 必填、C 标识符、同一 target 内唯一；建议每个 image 显式 `OUTPUT_DIR`。
+- `SLOT_SIZE` 必须是 arch 池对齐（x86-64 64）的整数倍。
+- `POOL_SLOTS` 是生成 storage 容量上限；运行期 `pool_slots` 可更小。
+- `RAM_SECTION`/`VERIFY_RWX` 默认 host ON；baremetal 交叉构建可关。
+- `DEFINE_PATH ON` 才定义 `COLD_CODE_IMAGE_<NAME>_PATH`（build-tree 绝对路径）。
+- helper 自动启用 ASM，校验未知参数/target 类型/arch backend。
+- 生成文件：`cold_code_<name>.bin`、`_image.h/.c`、`_stubs.S`、`_layout.map`、
+  `_symbols.txt`。
+- 多 image 同一 target 用不同 `NAME`；重复冷符号/image id 在链接前检查。
+
+## Port
+
+- `cold_code::host`：线程 TLS、file source、x86-64 fast accessor；静态链接 host。
+- `cold_code::baremetal`：`cold_code_baremetal_init()` 安装 per-core 表；
+  `cold_code_baremetal_cpu_id()` weak（默认 0），多核目标提供强定义；
+  `sync_code` 做 D-cache/I-cache 维护；无 libc。
+- 自定义 port：定义 `const cold_code_context_ops_t cold_code_context_ops`，
+  只链接 `cold_code::core`；参考 `tests/test_custom_port_v3.c`。
+- context ops：`abi_version/struct_size/arch/current/set_current/fatal/sync_code`。
+  一个 executable 一个实例。
 
 ## 测试
 
-- 测试使用纯 C + CTest，无第三方框架；断言宏在 `tests/test_util.h`，trace 回调在
-  `tests/test_runtime.h`。
-- 测试分类（19 个 CTest；fast/slow 矩阵见上）：
-  - 运行时：`cold_code.basic`、`cold_code.init`、`cold_code.lru_1way`、
-    `cold_code.lru_2way`、`cold_code.abi`、`cold_code.preinit_abort`、
-    `cold_code.image_format`、`cold_code.multi_manager`、
-    `cold_code.same_image_two_slots`、`cold_code.custom_port`、
-    `cold_code.multi_image`、`cold_code.image_mismatch`、`cold_code.example`。
-  - 构建期负向守卫：`cold_code.reject_cross_slot`、`cold_code.reject_straddle`、
-    `cold_code.reject_self_contained`、`cold_code.reject_no_asm`、
-    `cold_code.reject_duplicate_cold_symbol`。
-  - 自包含库集成：`cold_code.external_consumer`。
-- 新增运行时测试：
-  - 每个场景一个独立可执行文件，便于隔离 current manager/abort/统计；
-  - 每个测试 target 调用 `cold_code_add_image()`，传唯一 `NAME` 和唯一 `OUTPUT_DIR`；
-  - 测试只在全部检查通过后打印 `TEST_OK`；若设置
-    `PASS_REGULAR_EXPRESSION`，CTest 会忽略退出码，因此不要提前打印；
-  - 需要跨线程测试时链接 `Threads::Threads`（见 `test_multi_manager`、
-    `test_same_image_two_slots`、`test_custom_port`）。
-  - host-based 测试链接 `cold_code_core` + `test_host_port`（`tests/support/`）；
-    `test_custom_port` 故意只链接 `cold_code_core` 并在测试内实现 port + memory
-    source + fast accessor；不要给它加 `test_host_port` 或任何 host port，否则
-    隔离测试失效。
-  - `bench_fast` / `bench_slow` 是 benchmark target，不是 CTest；用
-    `./build/tests/bench_fast` / `bench_slow` 对比命中/缺失路径。
-- 新增构建失败测试：在 `tests/fixtures/` 放独立项目，用
-  `tests/run_expect_build_failure.cmake` 配置/构建并匹配错误文本；运行时 abort 用
-  `tests/run_expect_abort.cmake`。
-- 测试失败先看 `ctest -V` 中的 trace（load/evict 行）和
-  `cold_code_<name>_layout.map`，再核对 `<target>.map` 里的 marker/storage 段。
+26 个 CTest：
+
+- 运行时：`storage_guard`、`manager_abi`、`basic`、`init`、`lru_1way/2way`、
+  `abi`、`preinit_abort`、`image_format`、`multi_manager`、
+  `same_image_two_slots`、`custom_port`、`baremetal_port`、`multi_image`、
+  `image_mismatch`、`example`。
+- 负向构建：`reject_cross_slot`、`reject_straddle`、`reject_self_contained`、
+  `reject_duplicate_cold_symbol`、`reject_unsupported_arch`、`reject_dual_port`。
+- 集成：`auto_asm`、`arch_plugin`、`external_consumer`、`install_consumer`。
+- benchmark：`bench_fast`、`bench_slow`（不是 CTest）。
+
+新增运行时测试：
+
+- 每个场景一个独立 executable，隔离 current manager/abort/stats。
+- 每个测试 target 调 `cold_code_add_image()`，用唯一 `NAME`/`OUTPUT_DIR`。
+- 全部检查通过后才打印 `TEST_OK`；使用 `PASS_REGULAR_EXPRESSION` 时不要提前打印。
+- 多线程测试链接 `Threads::Threads`。
+- host-based 测试链接 `cold_code_host`；baremetal 测试链接 `cold_code_baremetal`；
+  `custom_port` 只链接 `cold_code_core` 并自带 port。
+- 新增构建失败 fixture：`tests/fixtures/<name>/` + `run_expect_build_failure.cmake`。
+- 安装消费 fixture：`tests/fixtures/install_consumer/` + `run_install_consumer.cmake`。
 
 ## 代码风格
 
-- C17，严格模式；库/示例/测试使用
+- C17 严格模式；库/示例/测试使用
   `-Wall -Wextra -Wpedantic -Wshadow -Werror`。
-- CMake 保持现有命名与结构；库必须保持自包含，不依赖根 `project_warnings`。
-- 格式化：
-  ```bash
-  clang-format -i cold_code/src/core/*.c cold_code/src/core/*.h \
-      cold_code/include/*.h cold_code/port/include/*.h \
-      cold_code/arch/x86_64/*.c cold_code/arch/x86_64/*.h \
-      example/*.c example/*.h example/cold/*.c example/cold/*.h \
-      tests/*.c tests/*.h tests/cold/*.c tests/cold/*.h \
-      tests/support/*.c tests/support/*.h \
-      tests/consumer/*.c tests/consumer/*.h tests/fixtures/*/*.c
-  ```
-  若系统只有版本化命令（如 `clang-format-22`），按实际替换。
+- core 与 baremetal 使用 `-ffreestanding -fno-builtin -fno-stack-protector`；
+  不得引入 libc 符号。
+- 公共头保持 C++ `extern "C"` 兼容；避免在头文件中定义可变全局。
+- 格式化命令见 README 末尾；按系统实际 `clang-format`/`clang-format-22` 替换。
 
 ## 已知限制
 
-- `tool/init.py --module` 的模板重命名仍是旧逻辑，不适配当前库结构；
-  `--project` 不受影响。
-- 未提供 `install()`/`export()`/`find_package()`；使用源码 `add_subdirectory`。
-- 库不提供 host port/source；每个 consumer 必须实现 `cold_code_port.h`（可参考
-  `example/port_host.c`）并链接 `cold_code_core`。
-- 消费方必须启用 ASM；Phase 3 计划去掉该前提。
-- stub 当前仅 x86-64；AVX `__m256` 参数上半部不保证。
-- 静态 RWX 段依赖内核/安全策略允许；嵌入式移植需替换 port 并做 cache 维护。
-- FAST_PATH 当前只支持 x86-64 host；默认 OFF，slow stub 仍完整保留。嵌入式可先用
-  slow stub；per-core/ARM/RISC-V 的 fast accessor/layout/模板在 Phase 4。
-- 生产级 per-core port / ARM/RISC-V stub 在 Phase 4；当前 host 是 per-thread。
-- 同一个 manager 并发使用、跨 slot 直调、冷函数数据/重定位仍不支持（后续阶段）。
+- stub/FAST_PATH 只实现 x86-64；ARM/RISC-V 仅 arch 插件接口。
+- host fast accessor 依赖 local-exec TLS，仅静态链接 host。
+- 静态 RWX 段依赖内核/安全策略；嵌入式需替换 linker/port 并做 cache 维护。
+- 冷函数仍需自包含、单 slot、禁止跨 slot 直调。
+- 无 pin；无锁；一 manager 一执行上下文。
+- baremetal 本期只有 slow stub。
+- slot 分配依赖链接顺序；生成器解析 binutils 文本输出。
+- image CRC 不是认证；不可信 image 等于任意代码执行。
+- `tool/init.py` 不再支持 `--module` 重命名。
 
 ## 关键文件
 
-- `cold_code/include/cold_code.h`：核心公共 API、manager/source/image 类型、`COLD_CODE()`。
-- `cold_code/port/include/cold_code_port.h`：port 实现契约（current manager/fatal）。
-- `cold_code/arch/x86_64/cold_code_port_fast.h`：可选 FAST_PATH accessor 契约。
-- `cold_code/arch/x86_64/cold_code_fast_layout.h`：stub offset 契约（生成器读取）。
-- `cold_code/src/core/manager.c`：manager 生命周期、storage owner、slot/LRU loader。
-- `cold_code/src/core/image.c`：image v2 头校验、CRC32、状态字符串。
-- `example/port_host.c/.h` + `port_host_fast_x86_64.S`：宿主参考 port/accessor。
-- `tests/support/port_host.c/.h` + `port_host_fast_x86_64.S`：测试 host port。
-- `tests/consumer/port_host.c/.h` + `port_host_fast_x86_64.S`：外部 consumer port。
+- `cold_code/include/cold_code.h`、`cold_code/include/cold_code/*.h`：公共 API。
+- `cold_code/src/core/manager.c`：manager 生命周期/storage/acquire/LRU。
+- `cold_code/src/core/storage.c`：storage 布局/尺寸/对齐。
+- `cold_code/src/core/image.c`：v3 wire header 编解码/CRC。
+- `cold_code/src/core/fault.c`：context ops 校验 + fatal 路径。
+- `cold_code/src/port/host/`：TLS/file source/fast accessor。
+- `cold_code/src/port/baremetal/`：per-core context。
+- `cold_code/src/arch/x86_64/`：ABI offset + 静态断言。
+- `cold_code/tool/gen_cold_code.py`、`cold_code/tool/arch/x86_64.py`：生成器/后端。
 - `cold_code/cmake/ColdCodeImage.cmake`：`cold_code_add_image()`。
-- `cold_code/tool/gen_cold_code.py` / `verify_cold_ram.py` /
-  `check_duplicate_symbols.py`：生成、RWX 校验、重复符号检查。
-- `example/main.c` / `example/cold/cold_functions.c`：最小消费者。
-- `tests/test_custom_port.c`：只链接 `cold_code_core` 的自定义 per-CPU port 示例。
-- `tests/bench_cold_call.c`：fast/slow 命中/缺失路径 benchmark。
-- `tests/CMakeLists.txt`：CTest 入口、benchmark target 与负向 fixture。
+- `cold_code/cmake/cold_code-config.cmake.in`：install/find_package。
+- `tests/CMakeLists.txt`：CTest/fixtures/benchmark。
+- `example/main.c`：最小消费者。
 
 ## 验证清单
 
 1. `cmake --build build -j` 成功。
-2. `ctest --test-dir build --output-on-failure` 19 个测试全部通过。
-3. `ctest -R 'lru|multi|same_image|custom_port|image_mismatch|reject|external_consumer' -V`
-   可看到预期 trace/错误文本。
-4. `./build/tests/bench_fast` 与 `bench_slow` 对比 hit ns/call；fast 明显低于 slow。
-5. 冷测试 target 的 POST_BUILD 输出包含 `flags RWE`。
-6. core-only 链接仍因 `cold_code_port_*` undefined 失败；fast accessor 只存在于 port。
-7. `BUILD_TESTING=OFF` 时库/示例仍可构建。
+2. `ctest --test-dir build --output-on-failure` 26/26。
+3. `./build/example/example` 输出 `loaded final: 1/1`。
+4. `./build/tests/bench_fast` 明显快于 `bench_slow`。
+5. host 冷 target POST_BUILD 输出包含 `flags RWE`，storage marker 也被校验。
+6. `nm -u` core/baremetal 目标无 `memcpy/malloc/stdio` 等 libc 符号。
+7. `cmake -S . -B build-notest -DBUILD_TESTING=OFF` 可构建；
+   `-DCOLD_CODE_BUILD_EXAMPLE=OFF` 可跳过 example。
+8. 安装到临时 prefix 后，`find_package(cold_code 3 CONFIG)` consumer 可构建运行。

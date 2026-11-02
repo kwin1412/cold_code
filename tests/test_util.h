@@ -3,23 +3,19 @@
 
 #include <stdio.h>
 
-#define CHECK(cond)                                                                                \
+#define CHECK(condition)                                                                           \
     do {                                                                                           \
-        if (!(cond)) {                                                                             \
-            fprintf(stderr, "CHECK failed at %s:%d: %s\n", __FILE__, __LINE__, #cond);             \
-            fflush(stderr);                                                                        \
+        if (!(condition)) {                                                                        \
+            fprintf(stderr, "CHECK failed at %s:%d: %s\n", __FILE__, __LINE__, #condition);       \
             return 1;                                                                              \
         }                                                                                          \
     } while (0)
 
 #define CHECK_EQ(actual, expected)                                                                 \
     do {                                                                                           \
-        long long check_actual_ = (long long)(actual);                                             \
-        long long check_expected_ = (long long)(expected);                                         \
-        if (check_actual_ != check_expected_) {                                                    \
-            fprintf(stderr, "CHECK_EQ failed at %s:%d: %s = %lld, expected %lld\n", __FILE__,      \
-                    __LINE__, #actual, check_actual_, check_expected_);                            \
-            fflush(stderr);                                                                        \
+        if ((actual) != (expected)) {                                                              \
+            fprintf(stderr, "CHECK_EQ failed at %s:%d: %s != %s\n", __FILE__, __LINE__, #actual,   \
+                    #expected);                                                                    \
             return 1;                                                                              \
         }                                                                                          \
     } while (0)
@@ -35,12 +31,10 @@
         if (check_diff_ > (double)(tolerance)) {                                                   \
             fprintf(stderr, "CHECK_NEAR failed at %s:%d: %s = %.17g, expected %.17g\n", __FILE__,  \
                     __LINE__, #actual, check_actual_, check_expected_);                            \
-            fflush(stderr);                                                                        \
             return 1;                                                                              \
         }                                                                                          \
     } while (0)
 
-/* Printed only after all checks pass; CTest PASS_REGULAR_EXPRESSION matches it. */
 #define TEST_OK()                                                                                  \
     do {                                                                                           \
         printf("TEST_OK\n");                                                                       \

@@ -5,7 +5,6 @@
 
 #include <stdio.h>
 
-/* Matches the trace lines used by the v1 tests and the README examples. */
 static inline void test_trace_event(void *ctx, cold_code_trace_event_t event, uint32_t image_slot,
                                     uint32_t way) {
     (void)ctx;

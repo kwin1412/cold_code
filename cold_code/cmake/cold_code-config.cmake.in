@@ -1,0 +1,14 @@
+@PACKAGE_INIT@
+
+set(COLD_CODE_INCLUDE_DIR "@PACKAGE_CMAKE_INSTALL_INCLUDEDIR@")
+set(COLD_CODE_TOOL_DIR "@PACKAGE_CMAKE_INSTALL_DATADIR@/cold_code/tool")
+set(COLD_CODE_LINKER_DIR "@PACKAGE_CMAKE_INSTALL_DATADIR@/cold_code/linker")
+set(COLD_CODE_ARCH_INCLUDE_DIR "${COLD_CODE_INCLUDE_DIR}")
+set(COLD_CODE_HELPER
+    "@PACKAGE_CMAKE_INSTALL_DATADIR@/cold_code/cmake/ColdCodeImage.cmake"
+    CACHE INTERNAL "Path to the cold_code_add_image() CMake helper")
+
+include("${CMAKE_CURRENT_LIST_DIR}/cold_codeTargets.cmake")
+include("${COLD_CODE_HELPER}")
+
+check_required_components(cold_code)

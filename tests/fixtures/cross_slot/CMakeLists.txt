@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(fixture_cross_slot LANGUAGES C ASM)
+project(fixture_cross_slot LANGUAGES C)
 
 add_subdirectory("${COLD_CODE_DIR}" cold_code)
 include("${COLD_CODE_HELPER}")

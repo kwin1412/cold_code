@@ -1,20 +1,10 @@
 #!/usr/bin/env python3
-"""Generate the v2 cold image, hot stubs, descriptor and storage bindings.
+"""Generate a v3 cold image, hot stubs, descriptor and opaque storage type.
 
-The cold image is an ELF linked at VMA 0 with only .cold_text kept.  This
-script:
-  * parses nm/readelf/objdump output,
-  * rejects absolute relocations / GOT references and unsafe cross-slot calls,
-  * requires every cold function to fit inside one image slot,
-  * pads the payload to a whole number of slots,
-  * writes a versioned image header (magic/version/image_id/CRC) followed by
-    the payload,
-  * emits namespaced hot stubs, the image descriptor and the generated storage
-    type used by consumers.
-
-There are no function IDs: a stub carries its image ID, image slot number and
-the offset inside that slot, and calls cold_code_acquire_slot() on every
-invocation so the slot-level LRU sees the access.
+The cold image is an ELF linked at VMA 0 with only .cold_text kept.  The
+arch backend owns relocation/call validation and stub emission; this script
+owns the arch-neutral layout, image v3 wire header, descriptor/storage
+generation and diagnostics.
 """
 
 from __future__ import annotations
@@ -27,48 +17,20 @@ import subprocess
 import sys
 import zlib
 
-MAX_POOL_SLOTS = 16
-IMAGE_MAGIC = 0x444C4F43  # bytes "COLD" little-endian
-IMAGE_VERSION = 2
-HEADER_FORMAT = "<IHHIIIIIII"
-HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
+from arch import ArchError, get_backend
+
 IMAGE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-FAST_LAYOUT_DEFINE_RE = re.compile(r"^\s*#define\s+(COLD_CODE_FAST_OFF_[A-Z0-9_]+)\s+(\d+)\b")
-FAST_ACCESSOR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-FAST_LAYOUT_REQUIRED = {
-    "COLD_CODE_FAST_OFF_MGR_IMAGE",
-    "COLD_CODE_FAST_OFF_MGR_SLOT_MAP",
-    "COLD_CODE_FAST_OFF_MGR_WAY_USED",
-    "COLD_CODE_FAST_OFF_MGR_POOL",
-    "COLD_CODE_FAST_OFF_MGR_POOL_SLOTS",
-    "COLD_CODE_FAST_OFF_MGR_TICK",
-    "COLD_CODE_FAST_OFF_MGR_STATS_HITS",
-    "COLD_CODE_FAST_OFF_MGR_INITIALIZED",
-    "COLD_CODE_FAST_OFF_IMAGE_ID",
-    "COLD_CODE_FAST_OFF_IMAGE_SLOT_SIZE",
-    "COLD_CODE_FAST_OFF_IMAGE_SLOT_COUNT",
-}
+HEADER_FORMAT = "<IHH14I"
+HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
+IMAGE_MAGIC = 0x444C4F43  # bytes "COLD" little-endian
+IMAGE_VERSION = 3
+ABI_VERSION = 1
+IMAGE_FLAG_PAYLOAD_CRC32 = 1
+MAX_POOL_SLOTS = 16
 
 
 class GenError(Exception):
     pass
-
-
-def parse_fast_layout(path: str) -> dict[str, int]:
-    values: dict[str, int] = {}
-    try:
-        with open(path, encoding="utf-8") as handle:
-            for line in handle:
-                match = FAST_LAYOUT_DEFINE_RE.match(line)
-                if match:
-                    values[match.group(1)] = int(match.group(2))
-    except OSError as exc:
-        raise GenError(f"cannot read FAST_PATH layout header {path}: {exc}") from exc
-
-    missing = sorted(FAST_LAYOUT_REQUIRED - values.keys())
-    if missing:
-        raise GenError(f"FAST_PATH layout header {path} is missing: {', '.join(missing)}")
-    return values
 
 
 def run_tool(cmd: list[str]) -> str:
@@ -79,6 +41,19 @@ def run_tool(cmd: list[str]) -> str:
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or exc.stdout or "").strip()
         raise GenError(f"command failed: {' '.join(cmd)}\n{detail}") from exc
+
+
+def parse_section(readelf: str, elf: str, section: str) -> tuple[int, int]:
+    out = run_tool([readelf, "-SW", elf])
+    for line in out.splitlines():
+        match = re.match(
+            r"\s*\[\s*\d+\]\s+(\S+)\s+(\S+)\s+([0-9a-fA-F]+)\s+"
+            r"[0-9a-fA-F]+\s+([0-9a-fA-F]+)",
+            line,
+        )
+        if match and match.group(1) == section:
+            return int(match.group(3), 16), int(match.group(4), 16)
+    raise GenError(f"section {section} not found in {elf}")
 
 
 def parse_symbols(nm: str, elf: str) -> list[dict]:
@@ -100,45 +75,6 @@ def parse_symbols(nm: str, elf: str) -> list[dict]:
     return symbols
 
 
-def parse_section(readelf: str, elf: str, section: str) -> tuple[int, int]:
-    out = run_tool([readelf, "-SW", elf])
-    for line in out.splitlines():
-        match = re.match(r"\s*\[\s*\d+\]\s+(\S+)\s+(\S+)\s+([0-9a-fA-F]+)\s+"
-                         r"[0-9a-fA-F]+\s+([0-9a-fA-F]+)", line)
-        if match and match.group(1) == section:
-            return int(match.group(3), 16), int(match.group(4), 16)
-    raise GenError(f"section {section} not found in {elf}")
-
-
-def check_relocations(readelf: str, elf: str) -> None:
-    allowed = {
-        "R_X86_64_NONE",
-        "R_X86_64_PC32",
-        "R_X86_64_PLT32",
-        "R_X86_64_PC64",
-        "R_X86_64_PC16",
-        "R_X86_64_PC8",
-    }
-    out = run_tool([readelf, "-rW", elf])
-    current_section = None
-    for line in out.splitlines():
-        section_match = re.match(r"Relocation section '([^']+)'", line)
-        if section_match:
-            current_section = section_match.group(1)
-            continue
-        if current_section is None or not current_section.startswith(".rela.cold_text"):
-            continue
-        match = re.match(r"\s*[0-9a-fA-F]+\s+[0-9a-fA-F]+\s+(R_[A-Z0-9_]+)\s+", line)
-        if not match:
-            continue
-        kind = match.group(1)
-        if kind not in allowed:
-            raise GenError(
-                f"unsupported relocation {kind} in the cold image; cold code must be "
-                "position independent and self-contained (no GOT/PLT/data references)"
-            )
-
-
 def check_undefined(nm: str, elf: str) -> None:
     out = run_tool([nm, "-u", elf]).strip()
     if out:
@@ -157,59 +93,37 @@ def check_no_straddle(functions: list[dict], slot_size: int) -> None:
             )
 
 
-def check_cross_slot_calls(objdump: str, elf: str, base: int, functions: list[dict],
-                           slot_size: int) -> None:
-    out = run_tool([objdump, "-d", "--no-show-raw-insn", elf])
-    call_re = re.compile(
-        r"^\s*([0-9a-fA-F]+):\s+(?:callq?|jmpq?)\s+"
-        r"(0x[0-9a-fA-F]+|[0-9a-fA-F]+)\s+<([^>]+)>"
-    )
-
-    for line in out.splitlines():
-        match = call_re.match(line)
-        if not match:
-            continue
-        insn_rel = int(match.group(1), 16) - base
-        target_rel = int(match.group(2), 16) - base
-
-        caller = None
-        for fn in functions:
-            if fn["offset"] <= insn_rel < fn["offset"] + fn["size"]:
-                caller = fn
-                break
-        if caller is None:
-            continue
-
-        callee = None
-        for fn in functions:
-            if fn["offset"] <= target_rel < fn["offset"] + fn["size"]:
-                callee = fn
-                break
-        if callee is None:
-            raise GenError(
-                f"{caller['name']}: direct call target 0x{target_rel:x} is not a "
-                "cold function; cold code must be self-contained"
-            )
-        if callee is caller:
-            continue
-
-        caller_slot = caller["offset"] // slot_size
-        callee_slot = callee["offset"] // slot_size
-        if caller_slot != callee_slot:
-            raise GenError(
-                f"{caller['name']} (image slot {caller_slot}) calls "
-                f"{callee['name']} (image slot {callee_slot}); cross-slot cold calls "
-                "are not supported with slot-level LRU. Put them in the same slot."
-            )
-
-
 def write_text(path: str, text: str) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(text)
 
 
+def require_args(args: argparse.Namespace) -> None:
+    required = [
+        "nm",
+        "readelf",
+        "objdump",
+        "elf",
+        "raw_bin",
+        "final_bin",
+        "image_name",
+        "slot_size",
+        "pool_slots",
+        "image_header",
+        "image_source",
+        "stubs",
+        "layout_map",
+        "symbols",
+    ]
+    missing = [name for name in required if getattr(args, name) is None]
+    if missing:
+        raise GenError("missing required arguments: " + ", ".join("--" + n.replace("_", "-")
+                                                                  for n in missing))
+
+
 def generate(args: argparse.Namespace) -> None:
+    require_args(args)
     if not IMAGE_NAME_RE.match(args.image_name):
         raise GenError(f"invalid image name '{args.image_name}'; use a C identifier")
     if args.slot_size <= 0:
@@ -217,15 +131,30 @@ def generate(args: argparse.Namespace) -> None:
     if args.pool_slots <= 0 or args.pool_slots > MAX_POOL_SLOTS:
         raise GenError(f"pool slots must be between 1 and {MAX_POOL_SLOTS}")
 
-    base, section_size = parse_section(args.readelf, args.elf, ".cold_text")
+    backend = get_backend(args.arch)
+    info = backend.info
+    if args.slot_size % info.pool_alignment != 0:
+        raise GenError(
+            f"slot size {args.slot_size} must be a multiple of the {info.name} pool "
+            f"alignment {info.pool_alignment}"
+        )
 
+    mode = args.stubs_mode
+    if mode == "fast" and not info.supports_fast:
+        raise GenError(f"arch backend '{info.name}' does not support fast stubs")
+    if mode == "slow" and not info.supports_slow:
+        raise GenError(f"arch backend '{info.name}' does not support slow stubs")
+
+    base, section_size = parse_section(args.readelf, args.elf, ".cold_text")
     with open(args.raw_bin, "rb") as handle:
         raw = handle.read()
     if not raw:
         raise GenError("the cold image is empty")
     if len(raw) < section_size:
-        raise GenError(f"cold binary is {len(raw)} bytes, smaller than .cold_text "
-                       f"({section_size} bytes)")
+        raise GenError(
+            f"cold binary is {len(raw)} bytes, smaller than .cold_text "
+            f"({section_size} bytes)"
+        )
 
     symbols = parse_symbols(args.nm, args.elf)
     functions = []
@@ -250,8 +179,6 @@ def generate(args: argparse.Namespace) -> None:
     if not globals_:
         raise GenError("the cold image contains no global COLD_CODE functions")
 
-    # Overlapping ranges would make call-site attribution ambiguous.  Sharing a
-    # start address (alias) is harmless for our purposes.
     ordered = sorted(functions, key=lambda fn: (fn["offset"], -fn["size"]))
     for prev, cur in zip(ordered, ordered[1:]):
         if cur["offset"] != prev["offset"] and cur["offset"] < prev["offset"] + prev["size"]:
@@ -260,49 +187,66 @@ def generate(args: argparse.Namespace) -> None:
     image_slot_count = (len(raw) + args.slot_size - 1) // args.slot_size
     if image_slot_count == 0 or image_slot_count > 0xFFFFFFFF:
         raise GenError("invalid image slot count")
-    pool_slot_count = min(args.pool_slots, image_slot_count)
+    max_pool_slots = min(args.pool_slots, image_slot_count)
 
     check_undefined(args.nm, args.elf)
-    check_relocations(args.readelf, args.elf)
+    backend.check_relocations(run_tool([args.readelf, "-rW", args.elf]))
     check_no_straddle(functions, args.slot_size)
-    check_cross_slot_calls(args.objdump, args.elf, base, functions, args.slot_size)
+    backend.check_cross_slot_calls(
+        run_tool([args.objdump, "-d", "--no-show-raw-insn", args.elf]),
+        base,
+        functions,
+        args.slot_size,
+    )
 
-    # Pad the payload so every slot read is a whole slot.
     padded = raw + b"\0" * (image_slot_count * args.slot_size - len(raw))
     payload_crc = zlib.crc32(padded) & 0xFFFFFFFF
     image_id = zlib.crc32(args.image_name.encode("utf-8")) & 0xFFFFFFFF
 
-    header = struct.pack(
-        HEADER_FORMAT,
-        IMAGE_MAGIC,
-        IMAGE_VERSION,
-        HEADER_SIZE,
-        image_id,
-        args.slot_size,
-        image_slot_count,
-        HEADER_SIZE,
-        payload_crc,
-        0,
-        0,
+    header = bytearray(
+        struct.pack(
+            HEADER_FORMAT,
+            IMAGE_MAGIC,
+            IMAGE_VERSION,
+            HEADER_SIZE,
+            image_id,
+            info.arch_id,
+            ABI_VERSION,
+            args.slot_size,
+            image_slot_count,
+            max_pool_slots,
+            HEADER_SIZE,
+            len(padded),
+            payload_crc,
+            IMAGE_FLAG_PAYLOAD_CRC32,
+            0,  # header CRC, patched below
+            0,
+            0,
+            0,
+        )
     )
     assert len(header) == HEADER_SIZE
+    struct.pack_into("<I", header, 48, zlib.crc32(header) & 0xFFFFFFFF)
 
     os.makedirs(os.path.dirname(args.final_bin) or ".", exist_ok=True)
     with open(args.final_bin, "wb") as handle:
         handle.write(header)
         handle.write(padded)
 
-    # --- Cold layout map ---------------------------------------------------
+    upper = args.image_name.upper()
     layout_lines = [
         "# Cold-code image layout (generated by cold_code/tool/gen_cold_code.py)",
         f"image_name      {args.image_name}",
         f"image_id        0x{image_id:08x}",
+        f"arch            {info.name} ({info.arch_id})",
+        f"abi_version     {ABI_VERSION}",
         f"header_bytes    {HEADER_SIZE}",
         f"payload_offset  0x{HEADER_SIZE:x}",
         f"payload_crc32   0x{payload_crc:08x}",
         f"slot_size       {args.slot_size}",
         f"image_slots     {image_slot_count}",
-        f"pool_slots      {pool_slot_count}",
+        f"pool_slots      {max_pool_slots}",
+        f"storage_align   {info.pool_alignment}",
         f"raw_bytes       0x{len(raw):x}",
         f"padded_bytes    0x{len(padded):x}",
         "",
@@ -319,16 +263,12 @@ def generate(args: argparse.Namespace) -> None:
     layout_lines.append("")
     write_text(args.layout_map, "\n".join(layout_lines))
 
-    # --- Symbol list for cross-image duplicate detection -------------------
     symbol_lines = [
         f"# image {args.image_name} id 0x{image_id:08x}\n",
         *(f"{fn['name']}\n" for fn in globals_),
     ]
     write_text(args.symbols, "".join(symbol_lines))
 
-    # --- Generated header --------------------------------------------------
-    name = args.image_name
-    upper = name.upper()
     guard = f"COLD_CODE_IMAGE_{upper}_H"
     header_lines = [
         "/* Auto-generated by cold_code/tool/gen_cold_code.py. Do not edit. */",
@@ -337,196 +277,104 @@ def generate(args: argparse.Namespace) -> None:
         "",
         '#include "cold_code.h"',
         "",
-        f'#define COLD_CODE_IMAGE_{upper}_NAME "{name}"',
+        f'#define COLD_CODE_IMAGE_{upper}_NAME "{args.image_name}"',
         f"#define COLD_CODE_IMAGE_{upper}_ID 0x{image_id:08x}u",
         f"#define COLD_CODE_IMAGE_{upper}_SLOT_SIZE {args.slot_size}u",
         f"#define COLD_CODE_IMAGE_{upper}_SLOT_COUNT {image_slot_count}u",
-        f"#define COLD_CODE_IMAGE_{upper}_POOL_SLOTS {pool_slot_count}u",
+        f"#define COLD_CODE_IMAGE_{upper}_MAX_POOL_SLOTS {max_pool_slots}u",
+        f"#define COLD_CODE_IMAGE_{upper}_STORAGE_ALIGN {info.pool_alignment}u",
+        f"#define COLD_CODE_IMAGE_{upper}_STORAGE_BYTES \\",
+        f"    COLD_CODE_STORAGE_SIZE({image_slot_count}u, {max_pool_slots}u, "
+        f"{args.slot_size}u, {info.pool_alignment}u)",
+        f'#define COLD_CODE_IMAGE_{upper}_FILE "cold_code_{args.image_name}.bin"',
         "",
-        f"extern const cold_code_image_t cold_code_image_{name};",
+        f"extern const cold_code_image_t cold_code_image_{args.image_name}",
+        '    __attribute__((visibility("hidden")));',
         "",
         "typedef struct {",
-        "    cold_code_storage_header_t header;",
-        f"    uint32_t slot_map[{image_slot_count}];",
-        f"    uint32_t way_slot[{pool_slot_count}];",
-        f"    uint64_t way_used[{pool_slot_count}];",
-        f"    unsigned char pool[{pool_slot_count}][{args.slot_size}]",
-        "        __attribute__((aligned(64)));",
-        f"}} cold_code_storage_{name}_t;",
-        "",
-        f"static inline void cold_code_storage_{name}_bind(",
-        f"    cold_code_manager_t *mgr, cold_code_storage_{name}_t *storage) {{",
-        "    mgr->storage = &storage->header;",
-        "    mgr->slot_map = storage->slot_map;",
-        "    mgr->way_slot = storage->way_slot;",
-        "    mgr->way_used = storage->way_used;",
-        "    mgr->pool = &storage->pool[0][0];",
-        f"    mgr->pool_slots = {pool_slot_count}u;",
-        "    mgr->storage_slot_count =",
-        "        (uint32_t)(sizeof(storage->slot_map) / sizeof(storage->slot_map[0]));",
-        "}",
+        f"    unsigned char _bytes[COLD_CODE_IMAGE_{upper}_STORAGE_BYTES];",
+        f"}} cold_code_storage_{args.image_name}_t",
+        f"    __attribute__((aligned({info.pool_alignment})));",
         "",
         f"#endif /* {guard} */",
         "",
     ]
     write_text(args.image_header, "\n".join(header_lines))
 
-    # --- Descriptor source -------------------------------------------------
+    arch_enum = getattr(backend, "ARCH_ENUM", "COLD_CODE_ARCH_UNKNOWN")
     source_lines = [
         "/* Auto-generated by cold_code/tool/gen_cold_code.py. Do not edit. */",
-        f'#include "cold_code_{name}_image.h"',
+        f'#include "cold_code_{args.image_name}_image.h"',
         "",
-        f"const cold_code_image_t cold_code_image_{name} = {{",
-        f'    .name = "{name}",',
-        f"    .image_id = 0x{image_id:08x}u,",
+        f"const cold_code_image_t cold_code_image_{args.image_name}",
+        '    __attribute__((visibility("hidden"))) = {',
+        f'    .image_id = 0x{image_id:08x}u,',
         f"    .slot_size = {args.slot_size}u,",
         f"    .slot_count = {image_slot_count}u,",
-        f"    .pool_slot_count = {pool_slot_count}u,",
+        f"    .max_pool_slots = {max_pool_slots}u,",
+        f"    .arch = {arch_enum},",
+        "    .abi_version = COLD_CODE_ABI_VERSION,",
+        "    .struct_size = sizeof(cold_code_image_t),",
+        f"    .storage_align = {info.pool_alignment}u,",
+        f'    .name = "{args.image_name}",',
         "};",
         "",
     ]
     write_text(args.image_source, "\n".join(source_lines))
 
-    fast_layout = None
-    if args.fast_path:
-        if not args.fast_layout:
-            raise GenError("FAST_PATH requires --fast-layout")
-        if not FAST_ACCESSOR_RE.match(args.fast_accessor):
-            raise GenError(f"invalid fast accessor symbol '{args.fast_accessor}'")
-        fast_layout = parse_fast_layout(args.fast_layout)
-
-    # --- Hot stubs and RWX section marker ----------------------------------
-    marker = f"cold_code_ram_marker_{name}"
-    asm = [
-        "/* Auto-generated by cold_code/tool/gen_cold_code.py. Do not edit. */",
-        '    .section .cold_ram,"awx",@nobits',
-        "    .balign 64",
-        f"    .globl {marker}",
-        f"    .hidden {marker}",
-        f"    .type {marker}, @object",
-        f"{marker}:",
-        "    .zero 1",
-        f"    .size {marker}, . - {marker}",
-        "",
-        "    .section .text",
-    ]
-
-    for index, fn in enumerate(globals_):
-        fn_name = fn["name"]
-        image_slot = fn["offset"] // args.slot_size
-        intra_offset = fn["offset"] % args.slot_size
-
-        asm += [
-            "    .p2align 4",
-            f"    .globl {fn_name}",
-            f"    .type {fn_name}, @function",
-            f"{fn_name}:",
-            "    .byte 0xf3,0x0f,0x1e,0xfa",  # endbr64
-        ]
-
-        if fast_layout is not None:
-            slow_label = f".Lcold_code_slow_{index}"
-            off = fast_layout
-            asm += [
-                f"    call {args.fast_accessor}",
-                "    testq %r11, %r11",
-                f"    je {slow_label}",
-                f"    cmpb $0, {off['COLD_CODE_FAST_OFF_MGR_INITIALIZED']}(%r11)",
-                f"    je {slow_label}",
-                f"    movq {off['COLD_CODE_FAST_OFF_MGR_IMAGE']}(%r11), %r10",
-                f"    cmpl $0x{image_id:08x}, {off['COLD_CODE_FAST_OFF_IMAGE_ID']}(%r10)",
-                f"    jne {slow_label}",
-                f"    cmpl ${image_slot}, {off['COLD_CODE_FAST_OFF_IMAGE_SLOT_COUNT']}(%r10)",
-                f"    jbe {slow_label}",
-                f"    movq {off['COLD_CODE_FAST_OFF_MGR_SLOT_MAP']}(%r11), %r10",
-                f"    movl {image_slot * 4}(%r10), %r10d",
-                "    testl %r10d, %r10d",
-                f"    je {slow_label}",
-                f"    cmpl {off['COLD_CODE_FAST_OFF_MGR_POOL_SLOTS']}(%r11), %r10d",
-                f"    ja {slow_label}",
-                "    subl $1, %r10d",
-                "    pushq %rax",
-                "    pushq %rcx",
-                f"    movq {off['COLD_CODE_FAST_OFF_MGR_TICK']}(%r11), %rax",
-                "    incq %rax",
-                f"    movq %rax, {off['COLD_CODE_FAST_OFF_MGR_TICK']}(%r11)",
-                f"    movq {off['COLD_CODE_FAST_OFF_MGR_WAY_USED']}(%r11), %rcx",
-                "    movq %rax, (%rcx,%r10,8)",
-                f"    incq {off['COLD_CODE_FAST_OFF_MGR_STATS_HITS']}(%r11)",
-                f"    movq {off['COLD_CODE_FAST_OFF_MGR_IMAGE']}(%r11), %rcx",
-                f"    movl {off['COLD_CODE_FAST_OFF_IMAGE_SLOT_SIZE']}(%rcx), %ecx",
-                "    imulq %rcx, %r10",
-                f"    addq {off['COLD_CODE_FAST_OFF_MGR_POOL']}(%r11), %r10",
-                f"    addq ${intra_offset}, %r10",
-                "    popq %rcx",
-                "    popq %rax",
-                "    jmp *%r10",
-                f"{slow_label}:",
-            ]
-
-        asm += [
-            "    pushq %rax",
-            "    pushq %rdi",
-            "    pushq %rsi",
-            "    pushq %rdx",
-            "    pushq %rcx",
-            "    pushq %r8",
-            "    pushq %r9",
-            "    subq $128, %rsp",
-        ]
-        for reg in range(8):
-            asm.append(f"    movdqu %xmm{reg}, {reg * 16}(%rsp)")
-        asm += [
-            f"    movl $0x{image_id:08x}, %edi",
-            f"    movl ${image_slot}, %esi",
-            "    call cold_code_acquire_slot",
-            "    movq %rax, %r11",
-        ]
-        for reg in range(8):
-            asm.append(f"    movdqu {reg * 16}(%rsp), %xmm{reg}")
-        asm += [
-            "    addq $128, %rsp",
-            "    popq %r9",
-            "    popq %r8",
-            "    popq %rcx",
-            "    popq %rdx",
-            "    popq %rsi",
-            "    popq %rdi",
-            "    popq %rax",
-            f"    addq ${intra_offset}, %r11",
-            "    jmp *%r11",
-            f"    .size {fn_name}, . - {fn_name}",
-            "",
-        ]
-
-    asm += ['    .section .note.GNU-stack,"",@progbits', ""]
-    write_text(args.stubs, "\n".join(asm))
+    accessor = args.fast_accessor or info.fast_accessor
+    write_text(
+        args.stubs,
+        backend.emit_stubs(
+            args.image_name,
+            globals_,
+            args.slot_size,
+            mode == "fast",
+            accessor,
+        ),
+    )
 
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--nm", required=True)
-    parser.add_argument("--readelf", required=True)
-    parser.add_argument("--objdump", required=True)
-    parser.add_argument("--elf", required=True)
-    parser.add_argument("--raw-bin", required=True)
-    parser.add_argument("--final-bin", required=True)
-    parser.add_argument("--image-name", required=True)
-    parser.add_argument("--slot-size", required=True, type=int)
-    parser.add_argument("--pool-slots", required=True, type=int)
-    parser.add_argument("--image-header", required=True)
-    parser.add_argument("--image-source", required=True)
-    parser.add_argument("--stubs", required=True)
-    parser.add_argument("--layout-map", required=True)
-    parser.add_argument("--symbols", required=True)
-    parser.add_argument("--fast-path", action="store_true")
-    parser.add_argument("--fast-layout")
-    parser.add_argument("--fast-accessor", default="cold_code_port_current_fast")
+    parser.add_argument("--arch", required=True)
+    parser.add_argument("--print-arch-info", action="store_true")
+    parser.add_argument("--print-cflags", action="store_true")
+    parser.add_argument("--stubs-mode", choices=("slow", "fast"), default="slow")
+    parser.add_argument("--fast-accessor")
+    parser.add_argument("--nm")
+    parser.add_argument("--readelf")
+    parser.add_argument("--objdump")
+    parser.add_argument("--elf")
+    parser.add_argument("--raw-bin")
+    parser.add_argument("--final-bin")
+    parser.add_argument("--image-name")
+    parser.add_argument("--slot-size", type=int)
+    parser.add_argument("--pool-slots", type=int)
+    parser.add_argument("--image-header")
+    parser.add_argument("--image-source")
+    parser.add_argument("--stubs")
+    parser.add_argument("--layout-map")
+    parser.add_argument("--symbols")
     args = parser.parse_args(argv)
 
     try:
+        backend = get_backend(args.arch)
+        info = backend.info
+        if args.print_arch_info:
+            print(f"arch={info.name}")
+            print(f"arch_id={info.arch_id}")
+            print(f"pool_alignment={info.pool_alignment}")
+            print(f"supports_slow={int(info.supports_slow)}")
+            print(f"supports_fast={int(info.supports_fast)}")
+            print(f"fast_accessor={info.fast_accessor}")
+            print(f"fast_abi_version={info.fast_abi_version}")
+            return 0
+        if args.print_cflags:
+            print(" ".join(info.cold_cflags))
+            return 0
         generate(args)
-    except GenError as exc:
+    except (GenError, ArchError) as exc:
         print(f"gen_cold_code: error: {exc}", file=sys.stderr)
         return 1
     return 0

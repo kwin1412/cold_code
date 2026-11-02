@@ -2,10 +2,10 @@
 
 #include "cold_code.h"
 #include "cold_code_example_image.h"
+#include "cold_code_host.h"
 #include "cold_functions.h"
-#include "port_host.h"
 
-static cold_code_storage_example_t g_storage COLD_CODE_STORAGE_SECTION;
+COLD_CODE_DEFINE_STORAGE(example, g_storage);
 static cold_code_manager_t g_manager;
 
 static void trace_event(void *ctx, cold_code_trace_event_t event, uint32_t image_slot,
@@ -22,24 +22,28 @@ static void trace_event(void *ctx, cold_code_trace_event_t event, uint32_t image
 
 int main(int argc, char **argv) {
     const char *image_path = argc > 1 ? argv[1] : COLD_CODE_IMAGE_EXAMPLE_PATH;
-    cold_code_file_source_t source;
-    cold_code_file_source_init(&source, image_path);
+    cold_code_file_source_t file;
+    cold_code_file_source_init(&file, image_path);
 
-    cold_code_storage_example_bind(&g_manager, &g_storage);
-    cold_code_config_t config = {
-        .source = &cold_code_file_source_ops,
-        .source_ctx = &source,
-        .verify_crc = true,
-        .trace = trace_event,
+    cold_code_manager_config_t config = {
+        .image = &cold_code_image_example,
+        .storage = &g_storage,
+        .storage_size = sizeof(g_storage),
+        .pool_slots = 1u,
+        .source = cold_code_file_source(&file),
+        .flags = COLD_CODE_INIT_VERIFY_CRC,
+        .trace = {.fn = trace_event, .ctx = NULL},
     };
 
-    cold_code_status_t status =
-        cold_code_manager_init(&g_manager, &cold_code_image_example, &config);
+    cold_code_status_t status = cold_code_manager_init(&g_manager, &config);
     if (status != COLD_CODE_OK) {
         fprintf(stderr, "cold_code_manager_init failed: %s\n", cold_code_status_string(status));
         return 1;
     }
-    cold_code_manager_use(&g_manager);
+    status = cold_code_manager_activate(&g_manager);
+    if (status != COLD_CODE_OK) {
+        return 1;
+    }
 
     cold_code_stats_t stats;
     if (cold_code_manager_stats(&g_manager, &stats) != COLD_CODE_OK) {
@@ -61,15 +65,10 @@ int main(int argc, char **argv) {
            (unsigned)stats.pool_slots);
     fflush(stdout);
 
-    /* mul lives in image slot 1: this evicts slot 0 with POOL_SLOTS=1. */
     printf("mul(4, 3) = %d\n", cold_code_mul(4, 3));
     fflush(stdout);
-
-    /* Reloading slot 0 evicts slot 1. */
     printf("add(2, 3) = %d\n", cold_code_add(2, 3));
     fflush(stdout);
-
-    /* div lives in image slot 2: this evicts slot 0 again. */
     printf("div(8, 2) = %d\n", cold_code_div(8, 2));
     fflush(stdout);
 
