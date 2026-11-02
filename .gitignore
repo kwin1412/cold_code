@@ -45,6 +45,6 @@ __pycache__/
 # OS files
 .DS_Store
 
-# Core dumps
-core
-core.*
+# Core dumps (root only; src/core/ is a source directory)
+/core
+/core.*

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify that the cold slot pool is mapped by a writable+executable PT_LOAD."""
+"""Verify that a generated .cold_ram marker is mapped by a writable+executable PT_LOAD."""
 
 from __future__ import annotations
 
@@ -60,7 +60,7 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--readelf", required=True)
     parser.add_argument("--elf", required=True)
-    parser.add_argument("--symbol", default="cold_code_slot_pool")
+    parser.add_argument("--symbol", required=True)
     args = parser.parse_args(argv)
 
     try:
@@ -99,7 +99,7 @@ def main(argv: list[str]) -> int:
         print(f"verify_cold_ram: error: {exc}", file=sys.stderr)
         return 1
 
-    print(f"cold_code_slot_pool: 0x{address:x} size 0x{size:x} "
+    print(f"{args.symbol}: 0x{address:x} size 0x{size:x} "
           f"in PT_LOAD flags {segment['flags']}")
     return 0
 

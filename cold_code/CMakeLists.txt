@@ -1,21 +1,28 @@
-file(GLOB_RECURSE COLD_CODE_SOURCES CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.h"
-)
-file(GLOB_RECURSE COLD_CODE_HEADERS CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/*.h"
+set(COLD_CODE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set(COLD_CODE_PORT_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/port/include")
+
+# Port contract is header-only.  The library intentionally does not provide a
+# port implementation; the executable links exactly one platform port
+# (example/port_host.c is the host reference; embedded ports differ).
+add_library(cold_code_port_interface INTERFACE)
+target_include_directories(cold_code_port_interface INTERFACE
+    "${COLD_CODE_INCLUDE_DIR}"
+    "${COLD_CODE_PORT_INCLUDE_DIR}"
 )
 
-add_library(cold_code STATIC ${COLD_CODE_SOURCES} ${COLD_CODE_HEADERS})
-
-target_include_directories(cold_code PUBLIC
-    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+# Platform-neutral loader: manager/image only.  Do not add port or source
+# implementations here.
+add_library(cold_code_core STATIC
+    src/core/manager.c
+    src/core/image.c
+    src/core/cold_code_internal.h
 )
-target_compile_features(cold_code PUBLIC c_std_17)
-set_target_properties(cold_code PROPERTIES C_EXTENSIONS OFF)
+target_link_libraries(cold_code_core PUBLIC cold_code_port_interface)
+target_include_directories(cold_code_core PRIVATE "${COLD_CODE_PORT_INCLUDE_DIR}")
+target_compile_features(cold_code_core PUBLIC c_std_17)
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(cold_code PRIVATE
+    target_compile_options(cold_code_core PRIVATE
         -Wall
         -Wextra
         -Wpedantic
@@ -23,6 +30,11 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         -Werror
     )
 endif()
+
+set_target_properties(cold_code_core PROPERTIES C_EXTENSIONS OFF)
+
+add_library(cold_code::core ALIAS cold_code_core)
+add_library(cold_code::port_interface ALIAS cold_code_port_interface)
 
 # Consumers include this helper after add_subdirectory(cold_code).  Using a
 # cache entry avoids relying on function-definition scope across directories.

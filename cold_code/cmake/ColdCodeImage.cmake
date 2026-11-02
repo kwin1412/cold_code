@@ -1,14 +1,21 @@
 include_guard(GLOBAL)
 
 # cold_code_add_image(<executable-target>
+#                     NAME <image-name>
 #                     SOURCES <cold sources...>
 #                     [SLOT_SIZE <bytes>]
 #                     [POOL_SLOTS <count>]
 #                     [OUTPUT_DIR <dir>])
 #
 # Builds a flat cold image from the given sources (compiled with the cold-code
-# restrictions), generates hot stubs/manifest, adds them to the target, and
-# checks after linking that the slot pool landed in an RWX PT_LOAD.
+# restrictions), generates a namespaced descriptor/storage type/hot stubs, and
+# checks after linking that the .cold_ram section is writable+executable.
+#
+# NAME is a C identifier and names all generated symbols and the generated
+# header: cold_code_image_<name>, cold_code_storage_<name>_t,
+# cold_code_storage_<name>_bind, cold_code_<name>_image.h.  A target may have
+# several images with distinct names.  Global cold function names must be
+# unique across those images; the helper checks this before linking.
 #
 # The helper is part of the cold_code library and locates its scripts/linker
 # files relative to its own location, so the library can be consumed with
@@ -17,18 +24,19 @@ include_guard(GLOBAL)
 # The consuming top-level project must enable ASM (generated stubs) and include
 # this file via the library-provided COLD_CODE_HELPER cache variable.
 #
+# The helper defines COLD_CODE_IMAGE_<NAME>_PATH for the consumer target; it is
+# the absolute build path of the final image.  Runtime code is free to use a
+# different path/source instead.
+#
 # Map outputs in OUTPUT_DIR:
-#   cold_image.map        - GNU ld map of the flat cold image
-#   cold_code_layout.map  - generated function/slot/intra-offset table
-#   <target>.map          - GNU ld map of the hot executable
+#   cold_image_<name>.map        - GNU ld map of the flat cold image
+#   cold_code_<name>_layout.map  - generated function/slot/intra-offset table
+# and once per target:
+#   <target>.map                 - GNU ld map of the hot executable
 #
 # POOL_SLOTS is the number of physical slots kept resident (slot-level LRU
 # capacity).  It is clamped to the total image slot count and must not exceed
 # COLD_CODE_MAX_POOL_SLOTS (16).
-#
-# The default OUTPUT_DIR is shared by targets in the same directory.  If more
-# than one target in a directory needs a cold image, pass distinct OUTPUT_DIR
-# values (one cold image per executable in this version).
 function(cold_code_add_image target)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     if(NOT CMAKE_ASM_COMPILER_LOADED)
@@ -43,14 +51,25 @@ function(cold_code_add_image target)
     set(ram_ld "${cold_code_dir}/linker/cold_ram.ld")
     set(generator "${cold_code_dir}/tool/gen_cold_code.py")
     set(verifier "${cold_code_dir}/tool/verify_cold_ram.py")
+    set(duplicate_checker "${cold_code_dir}/tool/check_duplicate_symbols.py")
 
-    cmake_parse_arguments(ARG "" "SLOT_SIZE;POOL_SLOTS;OUTPUT_DIR" "SOURCES" ${ARGN})
+    cmake_parse_arguments(ARG "" "NAME;SLOT_SIZE;POOL_SLOTS;OUTPUT_DIR" "SOURCES" ${ARGN})
 
+    if(NOT ARG_NAME)
+        message(FATAL_ERROR "cold_code_add_image: NAME is required")
+    endif()
+    if(NOT ARG_NAME MATCHES "^[A-Za-z_][A-Za-z0-9_]*$")
+        message(FATAL_ERROR
+            "cold_code_add_image: NAME '${ARG_NAME}' must be a C identifier")
+    endif()
     if(NOT ARG_SOURCES)
         message(FATAL_ERROR "cold_code_add_image: SOURCES is required")
     endif()
     if(NOT ARG_SLOT_SIZE)
         set(ARG_SLOT_SIZE 4096)
+    endif()
+    if(ARG_SLOT_SIZE LESS 1)
+        message(FATAL_ERROR "cold_code_add_image: SLOT_SIZE must be positive")
     endif()
     if(NOT ARG_POOL_SLOTS)
         set(ARG_POOL_SLOTS 4)
@@ -58,11 +77,24 @@ function(cold_code_add_image target)
     if(ARG_POOL_SLOTS LESS 1 OR ARG_POOL_SLOTS GREATER 16)
         message(FATAL_ERROR "cold_code_add_image: POOL_SLOTS must be between 1 and 16")
     endif()
+
+    # Names must be unique per target so generated symbols and convenience
+    # macros cannot collide.  Compare case-insensitively because the generated
+    # path macro/include guard use the upper-cased name.
+    string(TOLOWER "${ARG_NAME}" image_lower)
+    get_target_property(image_names_lower ${target} COLD_CODE_IMAGE_NAMES_LOWER)
+    if(image_names_lower AND image_lower IN_LIST image_names_lower)
+        message(FATAL_ERROR
+            "cold_code_add_image: image '${ARG_NAME}' is already defined for ${target}")
+    endif()
+    set_property(TARGET ${target} APPEND PROPERTY COLD_CODE_IMAGE_NAMES_LOWER "${image_lower}")
+
     if(NOT ARG_OUTPUT_DIR)
-        set(ARG_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/cold_code_image")
+        set(ARG_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/cold_code_${target}_${ARG_NAME}")
     endif()
 
-    set(objects "${target}_cold_image_objects")
+    string(TOUPPER "${ARG_NAME}" image_upper)
+    set(objects "${target}_${ARG_NAME}_cold_image_objects")
     add_library(${objects} STATIC ${ARG_SOURCES})
     target_include_directories(${objects} PRIVATE "${include_dir}")
     target_compile_features(${objects} PRIVATE c_std_17)
@@ -97,15 +129,16 @@ function(cold_code_add_image target)
     endif()
 
     file(MAKE_DIRECTORY "${ARG_OUTPUT_DIR}")
-    set(elf "${ARG_OUTPUT_DIR}/cold_image.elf")
-    set(cold_map "${ARG_OUTPUT_DIR}/cold_image.map")
-    set(raw_bin "${ARG_OUTPUT_DIR}/cold_code_raw.bin")
-    set(final_bin "${ARG_OUTPUT_DIR}/cold_code.bin")
-    set(gen_header "${ARG_OUTPUT_DIR}/cold_code_image.h")
-    set(gen_source "${ARG_OUTPUT_DIR}/cold_code_image.c")
-    set(gen_stubs "${ARG_OUTPUT_DIR}/cold_code_stubs.S")
-    set(layout_map "${ARG_OUTPUT_DIR}/cold_code_layout.map")
-    set(hot_map "${ARG_OUTPUT_DIR}/${target}.map")
+    set(elf "${ARG_OUTPUT_DIR}/cold_image_${ARG_NAME}.elf")
+    set(cold_map "${ARG_OUTPUT_DIR}/cold_image_${ARG_NAME}.map")
+    set(raw_bin "${ARG_OUTPUT_DIR}/cold_code_${ARG_NAME}_raw.bin")
+    set(final_bin "${ARG_OUTPUT_DIR}/cold_code_${ARG_NAME}.bin")
+    set(gen_header "${ARG_OUTPUT_DIR}/cold_code_${ARG_NAME}_image.h")
+    set(gen_source "${ARG_OUTPUT_DIR}/cold_code_${ARG_NAME}_image.c")
+    set(gen_stubs "${ARG_OUTPUT_DIR}/cold_code_${ARG_NAME}_stubs.S")
+    set(layout_map "${ARG_OUTPUT_DIR}/cold_code_${ARG_NAME}_layout.map")
+    set(symbols "${ARG_OUTPUT_DIR}/cold_code_${ARG_NAME}_symbols.txt")
+    set(hot_map "${CMAKE_CURRENT_BINARY_DIR}/${target}.map")
 
     add_custom_command(
         OUTPUT "${elf}"
@@ -116,7 +149,7 @@ function(cold_code_add_image target)
                 -Wl,--build-id=none "-Wl,-Map,${cold_map}"
                 -o "${elf}"
         DEPENDS ${objects} "$<TARGET_FILE:${objects}>" "${image_ld}"
-        COMMENT "Linking cold code image"
+        COMMENT "Linking cold code image ${ARG_NAME}"
         VERBATIM
     )
 
@@ -124,13 +157,13 @@ function(cold_code_add_image target)
         OUTPUT "${raw_bin}"
         COMMAND "${CMAKE_OBJCOPY}" -O binary "${elf}" "${raw_bin}"
         DEPENDS "${elf}"
-        COMMENT "Extracting cold code image"
+        COMMENT "Extracting cold code payload ${ARG_NAME}"
         VERBATIM
     )
 
     add_custom_command(
         OUTPUT "${final_bin}" "${gen_header}" "${gen_source}" "${gen_stubs}"
-               "${layout_map}"
+               "${layout_map}" "${symbols}"
         COMMAND "${Python3_EXECUTABLE}" "${generator}"
                 --nm "${CMAKE_NM}"
                 --readelf "${CMAKE_READELF}"
@@ -138,39 +171,67 @@ function(cold_code_add_image target)
                 --elf "${elf}"
                 --raw-bin "${raw_bin}"
                 --final-bin "${final_bin}"
+                --image-name "${ARG_NAME}"
                 --slot-size "${ARG_SLOT_SIZE}"
                 --pool-slots "${ARG_POOL_SLOTS}"
                 --image-header "${gen_header}"
                 --image-source "${gen_source}"
                 --stubs "${gen_stubs}"
                 --layout-map "${layout_map}"
-                --image-path "${final_bin}"
+                --symbols "${symbols}"
         DEPENDS "${elf}" "${raw_bin}" "${generator}"
-        COMMENT "Generating cold code stubs and manifest"
+        COMMENT "Generating cold code stubs and image ${ARG_NAME}"
         VERBATIM
     )
 
-    target_sources(${target} PRIVATE "${gen_source}" "${gen_stubs}")
+    target_sources(${target} PRIVATE "${gen_source}" "${gen_stubs}" "${gen_header}")
     target_include_directories(${target} PRIVATE "${ARG_OUTPUT_DIR}")
     set_source_files_properties("${gen_stubs}" PROPERTIES LANGUAGE ASM)
-    add_custom_target("${target}_cold_image_gen" DEPENDS
-        "${final_bin}" "${gen_header}" "${gen_source}" "${gen_stubs}" "${layout_map}")
-    add_dependencies(${target} "${target}_cold_image_gen")
+    target_compile_definitions(${target} PRIVATE
+        "COLD_CODE_IMAGE_${image_upper}_PATH=\"${final_bin}\"")
+    set(gen_target "${target}_cold_code_gen_${ARG_NAME}")
+    add_custom_target(${gen_target} DEPENDS
+        "${final_bin}" "${gen_header}" "${gen_source}" "${gen_stubs}" "${layout_map}"
+        "${symbols}")
+    add_dependencies(${target} "${gen_target}")
 
-    target_link_options(${target} PRIVATE
-        "-Wl,-T,${ram_ld}"
-        "-Wl,--no-warn-rwx-segments"
-        "-Wl,-Map,${hot_map}"
+    # Detect a global cold function defined by two images of this target before
+    # the linker reports an opaque multiple-definition error.  Depend on the
+    # image generator targets (not on their output files directly) so the
+    # Makefile generator does not duplicate the generation rules.
+    set_property(TARGET ${target} APPEND PROPERTY COLD_CODE_SYMBOL_FILES "${symbols}")
+    get_target_property(all_symbols ${target} COLD_CODE_SYMBOL_FILES)
+    set_property(TARGET ${target} APPEND PROPERTY COLD_CODE_GEN_TARGETS "${gen_target}")
+    get_target_property(all_gen_targets ${target} COLD_CODE_GEN_TARGETS)
+    set(check_target "${target}_cold_code_symbols_${ARG_NAME}")
+    add_custom_target(${check_target}
+        COMMAND "${Python3_EXECUTABLE}" "${duplicate_checker}"
+                --symbols ${all_symbols}
+        COMMENT "Checking cold function names for ${ARG_NAME}"
+        VERBATIM
     )
-    set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${ram_ld}")
-    set_property(DIRECTORY APPEND PROPERTY ADDITIONAL_CLEAN_FILES "${hot_map}")
+    add_dependencies(${check_target} ${all_gen_targets})
+    add_dependencies(${target} "${check_target}")
+
+    # The RAM linker fragment and the hot map are per target, not per image.
+    get_target_property(cold_link_applied ${target} COLD_CODE_LINK_APPLIED)
+    if(NOT cold_link_applied)
+        target_link_options(${target} PRIVATE
+            "-Wl,-T,${ram_ld}"
+            "-Wl,--no-warn-rwx-segments"
+            "-Wl,-Map,${hot_map}"
+        )
+        set_property(TARGET ${target} PROPERTY COLD_CODE_LINK_APPLIED TRUE)
+        set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${ram_ld}")
+        set_property(DIRECTORY APPEND PROPERTY ADDITIONAL_CLEAN_FILES "${hot_map}")
+    endif()
 
     add_custom_command(TARGET ${target} POST_BUILD
         COMMAND "${Python3_EXECUTABLE}" "${verifier}"
                 --readelf "${CMAKE_READELF}"
                 --elf "$<TARGET_FILE:${target}>"
-                --symbol cold_code_slot_pool
-        COMMENT "Verifying cold code RWX slot pool"
+                --symbol "cold_code_ram_marker_${ARG_NAME}"
+        COMMENT "Verifying cold code RWX storage (${ARG_NAME})"
         VERBATIM
     )
 endfunction()

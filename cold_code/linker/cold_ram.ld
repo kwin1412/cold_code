@@ -1,7 +1,8 @@
 /*
- * Place the generated .cold_ram sink after DATA_SEGMENT_END so GNU ld creates
- * a dedicated RWX PT_LOAD for it (the section's input flags are "awx" and it
- * is NOBITS, so p_filesz is 0 and the kernel maps anonymous zero pages).
+ * Place the caller's generated storage and the per-image RWX marker after
+ * DATA_SEGMENT_END so GNU ld creates a dedicated RWX PT_LOAD for them (the
+ * marker's input flags are "awx" and both inputs are NOBITS, so p_filesz is 0
+ * and the kernel maps anonymous zero pages).
  */
 SECTIONS
 {
