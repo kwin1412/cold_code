@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""Check that the x86-64 backend metadata matches the public/arch headers."""
+"""Check that the x86-64 backend metadata matches the public header."""
 
 from __future__ import annotations
 
 import argparse
 import re
+import struct
 import sys
+
+
+def c_define(text: str, name: str) -> int | None:
+    match = re.search(rf"#define\s+{name}\s+(\d+)u?", text)
+    return int(match.group(1)) if match else None
 
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tool-dir", required=True)
     parser.add_argument("--include-dir", required=True)
-    parser.add_argument("--arch-include-dir", required=True)
     args = parser.parse_args(argv)
 
     sys.path.insert(0, args.tool_dir)
@@ -26,38 +31,28 @@ def main(argv: list[str]) -> int:
     if not match or int(match.group(1)) != info.arch_id:
         failures.append("arch id mismatch between backend and version.h")
 
-    abi_text = open(f"{args.include_dir}/cold_code/abi/v1.h", encoding="utf-8").read()
-    match = re.search(r"COLD_CODE_MANAGER_STATE_READY\s+(0x[0-9a-fA-F]+|\d+)", abi_text)
-    if not match or int(match.group(1), 0) != 1:
-        failures.append("COLD_CODE_MANAGER_STATE_READY is not the expected ready bit")
-
-    arch_header = open(
-        f"{args.arch_include_dir}/cold_code/abi/v1/x86_64.h", encoding="utf-8"
-    ).read()
-    defines = {
-        name: int(value, 0)
-        for name, value in re.findall(
-            r"#define\s+(COLD_CODE_FAST_[A-Z0-9_]+)\s+(\d+)", arch_header
-        )
+    generator_text = open(f"{args.tool_dir}/gen_cold_code.py", encoding="utf-8").read()
+    format_match = re.search(r'HEADER_FORMAT\s*=\s*"([^"]+)"', generator_text)
+    header_size = struct.calcsize(format_match.group(1)) if format_match else None
+    generator_values = {
+        "COLD_CODE_IMAGE_VERSION": int(
+            re.search(r"^IMAGE_VERSION\s*=\s*(\d+)", generator_text, re.M).group(1)
+        ),
+        "COLD_CODE_ABI_VERSION": int(
+            re.search(r"^ABI_VERSION\s*=\s*(\d+)", generator_text, re.M).group(1)
+        ),
+        "COLD_CODE_IMAGE_HEADER_SIZE": header_size,
+        "COLD_CODE_MAX_POOL_SLOTS": int(
+            re.search(r"^MAX_POOL_SLOTS\s*=\s*(\d+)", generator_text, re.M).group(1)
+        ),
     }
-    expected = {
-        "COLD_CODE_FAST_ABI_VERSION": info.fast_abi_version,
-        "COLD_CODE_FAST_STATE_SIZE": 56,
-        "COLD_CODE_FAST_OFF_IMAGE": 0,
-        "COLD_CODE_FAST_OFF_SLOT_MAP": 8,
-        "COLD_CODE_FAST_OFF_WAY_USED": 16,
-        "COLD_CODE_FAST_OFF_POOL": 24,
-        "COLD_CODE_FAST_OFF_POOL_SLOTS": 32,
-        "COLD_CODE_FAST_OFF_STATE": 36,
-        "COLD_CODE_FAST_OFF_TICK": 40,
-        "COLD_CODE_FAST_OFF_HITS": 48,
-    }
-    for name, value in expected.items():
-        if defines.get(name) != value:
-            failures.append(f"{name}: backend/header value {defines.get(name)} != {value}")
+    for name, expected in generator_values.items():
+        actual = c_define(version_text, name)
+        if actual != expected:
+            failures.append(f"{name}: version.h value {actual} != generator {expected}")
 
-    if info.fast_accessor != "cold_code_context_current_fast":
-        failures.append("unexpected fast accessor name")
+    if not info.supports_slow:
+        failures.append("x86-64 backend must support slow stubs")
 
     if failures:
         for failure in failures:

@@ -17,7 +17,7 @@ extern "C" {
  * Runtime state placed at the beginning of caller-provided storage.  These
  * fields are internal to the loader; consumers must not read or write them.
  * The struct is public only so COLD_CODE_STORAGE_SIZE() can be a compile-time
- * expression shared by the core and generated headers.
+ * expression shared by the core and callers.
  */
 typedef struct cold_code_storage_header {
     void *owner; /* cold_code_manager_t * while claimed */
@@ -53,8 +53,8 @@ typedef struct cold_code_storage_header {
 
 /*
  * Exact bytes required for a storage serving pool_slots physical slots.
- * align_ must be a power of two.  The generated storage type is sized with
- * this macro for image->max_pool_slots.
+ * align_ must be a power of two.  Runtime callers compute this from the
+ * metadata returned by cold_code_manager_probe().
  */
 #define COLD_CODE_STORAGE_SIZE(slot_count_, pool_slots_, slot_size_, align_)                       \
     COLD_CODE_ALIGN_UP(COLD_CODE_STORAGE_WAY_USED_OFFSET(slot_count_, pool_slots_, slot_size_,     \
@@ -62,21 +62,27 @@ typedef struct cold_code_storage_header {
                            (size_t)(pool_slots_) * sizeof(uint64_t),                               \
                        (align_))
 
+/*
+ * Maximum static-buffer alignment for current arch backends.  A caller that
+ * sizes a static max buffer before probing can use this value; the manager
+ * validates the actual image storage_align from the wire header.
+ */
+#define COLD_CODE_STORAGE_ALIGN_MAX 64u
+
 /* Caller-supplied storage lives in executable RAM. */
 #ifndef COLD_CODE_STORAGE_SECTION
 #define COLD_CODE_STORAGE_SECTION __attribute__((section(".cold_ram")))
 #endif
 
-/* Generated type alias: COLD_CODE_STORAGE(app) -> cold_code_storage_app_t. */
-#define COLD_CODE_STORAGE(name_) cold_code_storage_##name_##_t
-
 /*
- * Declare a storage instance and a hidden section marker.  The marker lets the
- * post-build verifier check the storage the caller actually uses, not only the
- * generated marker.  The macro includes "static"; use it at file scope.
+ * Declare a raw storage buffer plus the hidden section marker used by the
+ * post-build RWX verifier.  `bytes_` and `align_` must be file-scope integer
+ * constant expressions.  The macro includes "static"; use it at file scope.
+ * The marker name keeps the cold_code_storage_marker_<name>_<var> scheme.
  */
-#define COLD_CODE_DEFINE_STORAGE(name_, var_)                                                      \
-    static cold_code_storage_##name_##_t var_ COLD_CODE_STORAGE_SECTION;                           \
+#define COLD_CODE_DEFINE_STORAGE(name_, var_, bytes_, align_)                                      \
+    static unsigned char var_[(bytes_)]                                                            \
+        COLD_CODE_STORAGE_SECTION __attribute__((aligned(align_)));                                \
     static unsigned char cold_code_storage_marker_##name_##_##var_[1]                              \
         COLD_CODE_STORAGE_SECTION __attribute__((used))
 
@@ -87,9 +93,13 @@ typedef struct cold_code_storage_header {
 #define COLD_CODE_SLOT_ALIGNED
 #endif
 
-/* Exact size/alignment required for a given image and pool size. */
-size_t cold_code_storage_required_size(const cold_code_image_t *image, uint32_t pool_slots);
-size_t cold_code_storage_required_align(const cold_code_image_t *image);
+/*
+ * Exact size/alignment implied by probe metadata.  pool_slots == 0 resolves to
+ * info->max_pool_slots, matching cold_code_manager_init().  Returns 0 for
+ * NULL/invalid metadata.
+ */
+size_t cold_code_storage_required_size(const cold_code_image_info_t *info, uint32_t pool_slots);
+size_t cold_code_storage_required_align(const cold_code_image_info_t *info);
 
 #ifdef __cplusplus
 }

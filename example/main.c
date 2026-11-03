@@ -1,11 +1,14 @@
 #include <stdio.h>
 
 #include "cold_code.h"
-#include "cold_code_example_image.h"
 #include "cold_code_host.h"
 #include "cold_functions.h"
 
-COLD_CODE_DEFINE_STORAGE(example, g_storage);
+COLD_CODE_DEFINE_STORAGE(example, g_storage,
+    COLD_CODE_STORAGE_SIZE(64u, COLD_CODE_IMAGE_EXAMPLE_MAX_POOL_SLOTS,
+                           COLD_CODE_IMAGE_EXAMPLE_SLOT_SIZE,
+                           COLD_CODE_IMAGE_EXAMPLE_STORAGE_ALIGN),
+    COLD_CODE_IMAGE_EXAMPLE_STORAGE_ALIGN);
 static cold_code_manager_t g_manager;
 
 static void trace_event(void *ctx, cold_code_trace_event_t event, uint32_t image_slot,
@@ -22,26 +25,32 @@ static void trace_event(void *ctx, cold_code_trace_event_t event, uint32_t image
 
 int main(int argc, char **argv) {
     const char *image_path = argc > 1 ? argv[1] : COLD_CODE_IMAGE_EXAMPLE_PATH;
-    cold_code_file_source_t file;
-    cold_code_file_source_init(&file, image_path);
+    cold_code_file_loader_t file;
+    cold_code_file_loader_init(&file, image_path);
+    cold_code_loader_t source = cold_code_file_loader(&file);
+    cold_code_image_info_t info;
+    cold_code_status_t status = cold_code_manager_probe(&source, &info);
+    if (status != COLD_CODE_OK ||
+        cold_code_storage_required_size(&info, 1u) > sizeof(g_storage)) {
+        fprintf(stderr, "cold_code_manager_probe failed: %s\n", cold_code_status_string(status));
+        return 1;
+    }
 
     cold_code_manager_config_t config = {
-        .image = &cold_code_image_example,
-        .storage = &g_storage,
-        .storage_size = sizeof(g_storage),
+        .exec_addr = &g_storage,
+        .exec_size = sizeof(g_storage),
+        .cpuid = 0u,
+        .context = &cold_code_host_context_ops,
         .pool_slots = 1u,
-        .source = cold_code_file_source(&file),
-        .flags = COLD_CODE_INIT_VERIFY_CRC,
+        .expected_image_id = info.image_id,
+        .loader = source,
+        .flags = COLD_CODE_INIT_VERIFY_CRC | COLD_CODE_INIT_EXPECT_IMAGE_ID,
         .trace = {.fn = trace_event, .ctx = NULL},
     };
 
-    cold_code_status_t status = cold_code_manager_init(&g_manager, &config);
+    status = cold_code_manager_init(&g_manager, &config);
     if (status != COLD_CODE_OK) {
         fprintf(stderr, "cold_code_manager_init failed: %s\n", cold_code_status_string(status));
-        return 1;
-    }
-    status = cold_code_manager_activate(&g_manager);
-    if (status != COLD_CODE_OK) {
         return 1;
     }
 
@@ -79,5 +88,6 @@ int main(int argc, char **argv) {
            (unsigned)stats.pool_slots, (unsigned)stats.image_slots);
 
     cold_code_manager_deinit(&g_manager);
+    cold_code_file_loader_close(&file);
     return 0;
 }

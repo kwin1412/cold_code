@@ -64,7 +64,7 @@
         {
             "label": "格式化: clang-format",
             "type": "shell",
-            "command": "clang-format -i cold_code/include/*.h cold_code/include/cold_code/*.h cold_code/include/cold_code/abi/*.h cold_code/src/core/*.c cold_code/src/core/*.h cold_code/src/port/*/*.c cold_code/src/port/*/include/*.h cold_code/src/arch/x86_64/*.c cold_code/src/arch/x86_64/include/cold_code/abi/v1/*.h example/*.c example/cold/*.c example/cold/*.h tests/*.c tests/*.h tests/cold/*.c tests/cold/*.h tests/consumer/*.c tests/fixtures/*/*.c",
+            "command": "clang-format -i cold_code/include/*.h cold_code/include/cold_code/*.h cold_code/src/core/*.c cold_code/src/core/*.h cold_code/src/port/*/*.c cold_code/src/port/*/include/*.h example/*.c example/cold/*.c example/cold/*.h tests/*.c tests/*.h tests/cold/*.c tests/cold/*.h tests/consumer/*.c tests/fixtures/*/*.c",
             "problemMatcher": []
         }
     ]

@@ -6,20 +6,11 @@
 
 #include "cold_code.h"
 #include "cold_code_host.h"
+#include "test_util.h"
 
-#if BENCH_FAST
-#include "cold_code_bench_fast_image.h"
-#define BENCH_IMAGE     cold_code_image_bench_fast
-#define BENCH_PATH      COLD_CODE_IMAGE_BENCH_FAST_PATH
-#define BENCH_LABEL     "fast"
-COLD_CODE_DEFINE_STORAGE(bench_fast, g_storage);
-#else
-#include "cold_code_bench_slow_image.h"
-#define BENCH_IMAGE     cold_code_image_bench_slow
-#define BENCH_PATH      COLD_CODE_IMAGE_BENCH_SLOW_PATH
-#define BENCH_LABEL     "slow"
-COLD_CODE_DEFINE_STORAGE(bench_slow, g_storage);
-#endif
+#define BENCH_PATH COLD_CODE_IMAGE_BENCH_SLOW_PATH
+#define BENCH_LABEL "slow"
+COLD_CODE_DEFINE_STORAGE(bench_slow, g_storage, TEST_STORAGE_BYTES, TEST_STORAGE_ALIGN);
 
 static cold_code_manager_t g_manager;
 
@@ -36,22 +27,27 @@ static uint64_t now_ns(void) {
 
 int main(int argc, char **argv) {
     const char *path = argc > 1 ? argv[1] : BENCH_PATH;
-    cold_code_file_source_t file;
-    cold_code_file_source_init(&file, path);
+    cold_code_file_loader_t file;
+    cold_code_file_loader_init(&file, path);
+    cold_code_loader_t source = cold_code_file_loader(&file);
+    cold_code_image_info_t info;
+    if (test_probe_ok(source, 1u, sizeof(g_storage), &info) == 0) {
+        fprintf(stderr, "probe failed or storage too small\n");
+        return 1;
+    }
 
     cold_code_manager_config_t config = {
-        .image = &BENCH_IMAGE,
-        .storage = &g_storage,
-        .storage_size = sizeof(g_storage),
+        .exec_addr = &g_storage,
+        .exec_size = sizeof(g_storage),
+        .cpuid = 0u,
+        .context = &cold_code_host_context_ops,
         .pool_slots = 1u,
-        .source = cold_code_file_source(&file),
-        .flags = COLD_CODE_INIT_VERIFY_CRC,
+        .expected_image_id = info.image_id,
+        .loader = source,
+        .flags = COLD_CODE_INIT_VERIFY_CRC | COLD_CODE_INIT_EXPECT_IMAGE_ID,
     };
     if (cold_code_manager_init(&g_manager, &config) != COLD_CODE_OK) {
         fprintf(stderr, "manager init failed\n");
-        return 1;
-    }
-    if (cold_code_manager_activate(&g_manager) != COLD_CODE_OK) {
         return 1;
     }
 
@@ -83,5 +79,6 @@ int main(int argc, char **argv) {
            (unsigned long long)stats.evictions, sink);
 
     cold_code_manager_deinit(&g_manager);
+    cold_code_file_loader_close(&file);
     return 0;
 }

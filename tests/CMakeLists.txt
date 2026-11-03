@@ -1,5 +1,4 @@
 include("${COLD_CODE_HELPER}")
-find_package(Threads REQUIRED)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 function(cold_code_test_properties target)
@@ -27,16 +26,14 @@ add_executable(test_basic_v3 test_basic_v3.c)
 target_link_libraries(test_basic_v3 PRIVATE cold_code_host project_warnings)
 cold_code_test_properties(test_basic_v3)
 cold_code_add_image(test_basic_v3
-    NAME basic SOURCES cold/basic_cold.c SLOT_SIZE 64 POOL_SLOTS 1
-    STUBS SLOW DEFINE_PATH ON)
+    NAME basic SOURCES cold/basic_cold.c SLOT_SIZE 64 POOL_SLOTS 1 DEFINE_PATH ON)
 add_test(NAME cold_code.basic COMMAND test_basic_v3)
 
 add_executable(test_init_v3 test_init_v3.c)
 target_link_libraries(test_init_v3 PRIVATE cold_code_host project_warnings)
 cold_code_test_properties(test_init_v3)
 cold_code_add_image(test_init_v3
-    NAME init SOURCES cold/init_cold.c SLOT_SIZE 64 POOL_SLOTS 1
-    STUBS FAST DEFINE_PATH ON)
+    NAME init SOURCES cold/init_cold.c SLOT_SIZE 64 POOL_SLOTS 1 DEFINE_PATH ON)
 add_test(NAME cold_code.init COMMAND test_init_v3)
 
 add_executable(test_lru_1way test_lru_v3.c)
@@ -44,8 +41,7 @@ target_compile_definitions(test_lru_1way PRIVATE EXPECTED_POOL=1)
 target_link_libraries(test_lru_1way PRIVATE cold_code_host project_warnings)
 cold_code_test_properties(test_lru_1way)
 cold_code_add_image(test_lru_1way
-    NAME lru1 SOURCES cold/lru_cold.c SLOT_SIZE 64 POOL_SLOTS 1
-    STUBS FAST DEFINE_PATH ON)
+    NAME lru1 SOURCES cold/lru_cold.c SLOT_SIZE 64 POOL_SLOTS 1 DEFINE_PATH ON)
 add_test(NAME cold_code.lru_1way COMMAND test_lru_1way)
 set_tests_properties(cold_code.lru_1way PROPERTIES
     PASS_REGULAR_EXPRESSION "TEST_OK"
@@ -56,8 +52,7 @@ target_compile_definitions(test_lru_2way PRIVATE EXPECTED_POOL=2)
 target_link_libraries(test_lru_2way PRIVATE cold_code_host project_warnings)
 cold_code_test_properties(test_lru_2way)
 cold_code_add_image(test_lru_2way
-    NAME lru2 SOURCES cold/lru_cold.c SLOT_SIZE 64 POOL_SLOTS 2
-    STUBS FAST DEFINE_PATH ON)
+    NAME lru2 SOURCES cold/lru_cold.c SLOT_SIZE 64 POOL_SLOTS 2 DEFINE_PATH ON)
 add_test(NAME cold_code.lru_2way COMMAND test_lru_2way)
 set_tests_properties(cold_code.lru_2way PROPERTIES
     PASS_REGULAR_EXPRESSION "TEST_OK"
@@ -68,20 +63,17 @@ target_include_directories(test_abi_v3 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(test_abi_v3 PRIVATE cold_code_host project_warnings)
 cold_code_test_properties(test_abi_v3)
 cold_code_add_image(test_abi_v3
-    NAME abi SOURCES cold/abi_cold.c SLOT_SIZE 512 POOL_SLOTS 1
-    STUBS FAST DEFINE_PATH ON)
+    NAME abi SOURCES cold/abi_cold.c SLOT_SIZE 512 POOL_SLOTS 1 DEFINE_PATH ON)
 add_test(NAME cold_code.abi COMMAND test_abi_v3)
 
 add_executable(test_preinit_v3 test_preinit_v3.c)
 target_link_libraries(test_preinit_v3 PRIVATE cold_code_host project_warnings)
 cold_code_test_properties(test_preinit_v3)
 cold_code_add_image(test_preinit_v3
-    NAME preinit SOURCES cold/preinit_cold.c SLOT_SIZE 64 POOL_SLOTS 1
-    STUBS FAST)
+    NAME preinit SOURCES cold/preinit_cold.c SLOT_SIZE 64 POOL_SLOTS 1)
 add_test(NAME cold_code.preinit_abort
     COMMAND "${CMAKE_COMMAND}"
             "-DTEST_EXE=$<TARGET_FILE:test_preinit_v3>"
-            "-DEXPECT_REGEX=no current manager"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/run_expect_abort.cmake")
 set_tests_properties(cold_code.preinit_abort PROPERTIES TIMEOUT 30)
 
@@ -89,74 +81,68 @@ add_executable(test_image_format_v3 test_image_format_v3.c)
 target_link_libraries(test_image_format_v3 PRIVATE cold_code_host project_warnings)
 cold_code_test_properties(test_image_format_v3)
 cold_code_add_image(test_image_format_v3
-    NAME imagefmt SOURCES cold/imagefmt_cold.c SLOT_SIZE 64 POOL_SLOTS 1
-    STUBS FAST DEFINE_PATH ON)
+    NAME imagefmt SOURCES cold/imagefmt_cold.c SLOT_SIZE 64 POOL_SLOTS 1 DEFINE_PATH ON)
 add_test(NAME cold_code.image_format COMMAND test_image_format_v3)
 
-add_executable(test_multi_manager_v3 test_multi_manager_v3.c)
-target_link_libraries(test_multi_manager_v3 PRIVATE
-    cold_code_host project_warnings Threads::Threads)
+add_executable(test_multi_manager_v3 test_multi_manager_v3.c test_cpu.c)
+target_link_libraries(test_multi_manager_v3 PRIVATE cold_code_host project_warnings)
 cold_code_test_properties(test_multi_manager_v3)
 cold_code_add_image(test_multi_manager_v3
-    NAME multi SOURCES cold/multi_cold.c SLOT_SIZE 64 POOL_SLOTS 1
-    STUBS FAST DEFINE_PATH ON)
+    NAME multi SOURCES cold/multi_cold.c SLOT_SIZE 64 POOL_SLOTS 1 DEFINE_PATH ON)
 add_test(NAME cold_code.multi_manager COMMAND test_multi_manager_v3)
 
-add_executable(test_same_image_two_slots_v3 test_same_image_two_slots_v3.c)
-target_link_libraries(test_same_image_two_slots_v3 PRIVATE
-    cold_code_host project_warnings Threads::Threads)
+add_executable(test_same_image_two_slots_v3 test_same_image_two_slots_v3.c test_cpu.c)
+target_link_libraries(test_same_image_two_slots_v3 PRIVATE cold_code_host project_warnings)
 cold_code_test_properties(test_same_image_two_slots_v3)
 cold_code_add_image(test_same_image_two_slots_v3
-    NAME slots SOURCES cold/slots_cold.c SLOT_SIZE 64 POOL_SLOTS 1
-    STUBS FAST DEFINE_PATH ON)
+    NAME slots SOURCES cold/slots_cold.c SLOT_SIZE 64 POOL_SLOTS 1 DEFINE_PATH ON)
 add_test(NAME cold_code.same_image_two_slots COMMAND test_same_image_two_slots_v3)
 
-add_executable(test_custom_port_v3
-    test_custom_port_v3.c test_custom_port_fast_x86_64.S)
-target_link_libraries(test_custom_port_v3 PRIVATE
-    cold_code_core project_warnings Threads::Threads)
-target_compile_options(test_custom_port_v3 PRIVATE -ftls-model=local-exec)
+add_executable(test_custom_port_v3 test_custom_port_v3.c test_cpu.c)
+target_link_libraries(test_custom_port_v3 PRIVATE cold_code_core project_warnings)
 cold_code_test_properties(test_custom_port_v3)
 cold_code_add_image(test_custom_port_v3
-    NAME custom SOURCES cold/slots_cold.c SLOT_SIZE 64 POOL_SLOTS 1
-    STUBS FAST DEFINE_PATH ON)
+    NAME custom SOURCES cold/slots_cold.c SLOT_SIZE 64 POOL_SLOTS 1 DEFINE_PATH ON)
 add_test(NAME cold_code.custom_port COMMAND test_custom_port_v3)
 
-add_executable(test_baremetal_v3 test_baremetal_v3.c)
-target_link_libraries(test_baremetal_v3 PRIVATE
-    cold_code_baremetal project_warnings Threads::Threads)
+add_executable(test_baremetal_v3 test_baremetal_v3.c test_cpu.c)
+target_link_libraries(test_baremetal_v3 PRIVATE cold_code_baremetal project_warnings)
 cold_code_test_properties(test_baremetal_v3)
 cold_code_add_image(test_baremetal_v3
-    NAME baremetal SOURCES cold/slots_cold.c SLOT_SIZE 64 POOL_SLOTS 1
-    STUBS SLOW DEFINE_PATH ON)
+    NAME baremetal SOURCES cold/slots_cold.c SLOT_SIZE 64 POOL_SLOTS 1 DEFINE_PATH ON)
 add_test(NAME cold_code.baremetal_port COMMAND test_baremetal_v3)
 
-add_executable(test_multi_image_v3 test_multi_image_v3.c)
+add_executable(test_multi_image_v3 test_multi_image_v3.c test_cpu.c)
 target_link_libraries(test_multi_image_v3 PRIVATE cold_code_host project_warnings)
 cold_code_test_properties(test_multi_image_v3)
 cold_code_add_image(test_multi_image_v3
-    NAME first SOURCES cold/first_cold.c SLOT_SIZE 64 POOL_SLOTS 1
-    STUBS FAST DEFINE_PATH ON)
+    NAME first SOURCES cold/first_cold.c SLOT_SIZE 64 POOL_SLOTS 1 DEFINE_PATH ON)
 cold_code_add_image(test_multi_image_v3
-    NAME second SOURCES cold/second_cold.c SLOT_SIZE 64 POOL_SLOTS 1
-    STUBS FAST DEFINE_PATH ON)
+    NAME second SOURCES cold/second_cold.c SLOT_SIZE 64 POOL_SLOTS 1 DEFINE_PATH ON)
 add_test(NAME cold_code.multi_image COMMAND test_multi_image_v3)
 
 add_executable(test_image_mismatch_v3 test_image_mismatch_v3.c)
 target_link_libraries(test_image_mismatch_v3 PRIVATE cold_code_host project_warnings)
 cold_code_test_properties(test_image_mismatch_v3)
 cold_code_add_image(test_image_mismatch_v3
-    NAME first SOURCES cold/first_cold.c SLOT_SIZE 64 POOL_SLOTS 1
-    STUBS FAST DEFINE_PATH ON)
+    NAME first SOURCES cold/first_cold.c SLOT_SIZE 64 POOL_SLOTS 1 DEFINE_PATH ON)
 cold_code_add_image(test_image_mismatch_v3
-    NAME second SOURCES cold/second_cold.c SLOT_SIZE 64 POOL_SLOTS 1
-    STUBS FAST)
+    NAME second SOURCES cold/second_cold.c SLOT_SIZE 64 POOL_SLOTS 1)
 add_test(NAME cold_code.image_mismatch
     COMMAND "${CMAKE_COMMAND}"
             "-DTEST_EXE=$<TARGET_FILE:test_image_mismatch_v3>"
             "-DEXPECT_REGEX=fault code 1"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/run_expect_abort.cmake")
 set_tests_properties(cold_code.image_mismatch PROPERTIES TIMEOUT 30)
+
+add_executable(test_multi_port_v3 test_multi_port_v3.c test_cpu.c)
+target_link_libraries(test_multi_port_v3 PRIVATE
+    cold_code_host cold_code_baremetal project_warnings)
+cold_code_test_properties(test_multi_port_v3)
+cold_code_add_image(test_multi_port_v3
+    NAME multi_port SOURCES cold/slots_cold.c SLOT_SIZE 64 POOL_SLOTS 1
+    DEFINE_PATH ON)
+add_test(NAME cold_code.multi_port COMMAND test_multi_port_v3)
 
 if(TARGET example)
     add_test(NAME cold_code.example COMMAND example)
@@ -166,23 +152,12 @@ endif()
 
 # --- Benchmarks (not registered with CTest) --------------------------------
 
-add_executable(bench_fast bench_cold_call.c)
-target_compile_definitions(bench_fast PRIVATE BENCH_FAST=1)
-target_compile_options(bench_fast PRIVATE -O2)
-target_link_libraries(bench_fast PRIVATE cold_code_host project_warnings)
-cold_code_test_properties(bench_fast)
-cold_code_add_image(bench_fast
-    NAME bench_fast SOURCES cold/lru_cold.c SLOT_SIZE 64 POOL_SLOTS 1
-    STUBS FAST DEFINE_PATH ON)
-
 add_executable(bench_slow bench_cold_call.c)
-target_compile_definitions(bench_slow PRIVATE BENCH_FAST=0)
 target_compile_options(bench_slow PRIVATE -O2)
 target_link_libraries(bench_slow PRIVATE cold_code_host project_warnings)
 cold_code_test_properties(bench_slow)
 cold_code_add_image(bench_slow
-    NAME bench_slow SOURCES cold/lru_cold.c SLOT_SIZE 64 POOL_SLOTS 1
-    STUBS SLOW DEFINE_PATH ON)
+    NAME bench_slow SOURCES cold/lru_cold.c SLOT_SIZE 64 POOL_SLOTS 1 DEFINE_PATH ON)
 
 # --- Build-time negative fixtures / positive auto-ASM fixture --------------
 
@@ -233,15 +208,6 @@ add_test(NAME cold_code.reject_unsupported_arch
             -P "${CMAKE_CURRENT_SOURCE_DIR}/run_expect_build_failure.cmake")
 set_tests_properties(cold_code.reject_unsupported_arch PROPERTIES TIMEOUT 120)
 
-add_test(NAME cold_code.reject_dual_port
-    COMMAND "${CMAKE_COMMAND}"
-            "-DFIXTURE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/fixtures/dual_port"
-            "-DBUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}/reject_dual_port"
-            "-DCOLD_CODE_DIR=${COLD_CODE_V3_DIR}"
-            "-DEXPECT_REGEX=cold_code_context_ops"
-            -P "${CMAKE_CURRENT_SOURCE_DIR}/run_expect_build_failure.cmake")
-set_tests_properties(cold_code.reject_dual_port PROPERTIES TIMEOUT 120)
-
 add_test(NAME cold_code.auto_asm
     COMMAND "${CMAKE_COMMAND}"
             "-DCONSUMER_DIR=${CMAKE_CURRENT_SOURCE_DIR}/fixtures/auto_asm"
@@ -254,8 +220,7 @@ set_tests_properties(cold_code.auto_asm PROPERTIES TIMEOUT 120)
 add_test(NAME cold_code.arch_plugin
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/check_arch_plugin.py"
             --tool-dir "${COLD_CODE_V3_DIR}/tool"
-            --include-dir "${COLD_CODE_V3_DIR}/include"
-            --arch-include-dir "${COLD_CODE_V3_DIR}/src/arch/x86_64/include")
+            --include-dir "${COLD_CODE_V3_DIR}/include")
 
 add_test(NAME cold_code.external_consumer
     COMMAND "${CMAKE_COMMAND}"

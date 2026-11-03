@@ -1,7 +1,23 @@
 #ifndef TEST_UTIL_H
 #define TEST_UTIL_H
 
+#include "cold_code.h"
+
 #include <stdio.h>
+
+/* Generous static exec buffer for runtime tests. */
+#define TEST_STORAGE_BYTES 16384u
+#define TEST_STORAGE_ALIGN COLD_CODE_STORAGE_ALIGN_MAX
+
+/* Probe metadata and confirm the static test exec buffer is large enough. */
+static inline int test_probe_ok(cold_code_loader_t loader, uint32_t pool_slots,
+                                size_t exec_size, cold_code_image_info_t *info) {
+    if (cold_code_manager_probe(&loader, info) != COLD_CODE_OK) {
+        return 0;
+    }
+    size_t required = cold_code_storage_required_size(info, pool_slots);
+    return required != 0u && required <= exec_size;
+}
 
 #define CHECK(condition)                                                                           \
     do {                                                                                           \

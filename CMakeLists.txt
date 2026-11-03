@@ -2,9 +2,9 @@ cmake_minimum_required(VERSION 3.20)
 
 set(PROJECT_NAME cold-code)
 
-# ASM is intentionally not listed here: the cold_code library/helper enables it
-# when an image or the fast accessor needs it.
-project(${PROJECT_NAME} VERSION 3.0.0 LANGUAGES C)
+# ASM is intentionally not listed here: the cold_code helper enables it for
+# generated cold image stubs.
+project(${PROJECT_NAME} VERSION 5.0.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)

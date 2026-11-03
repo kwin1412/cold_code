@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 _Static_assert(sizeof(cold_code_image_header_t) == COLD_CODE_IMAGE_HEADER_SIZE,
-               "v3 image header must be exactly 64 bytes");
+               "v4 image header must be exactly 64 bytes");
 _Static_assert(offsetof(cold_code_image_header_t, magic) == 0u, "header layout");
 _Static_assert(offsetof(cold_code_image_header_t, version) == 4u, "header layout");
 _Static_assert(offsetof(cold_code_image_header_t, header_size) == 6u, "header layout");
@@ -19,8 +19,109 @@ _Static_assert(offsetof(cold_code_image_header_t, payload_size) == 36u, "header 
 _Static_assert(offsetof(cold_code_image_header_t, payload_crc32) == 40u, "header layout");
 _Static_assert(offsetof(cold_code_image_header_t, flags) == 44u, "header layout");
 _Static_assert(offsetof(cold_code_image_header_t, header_crc32) == 48u, "header layout");
+_Static_assert(offsetof(cold_code_image_header_t, storage_align) == 52u, "header layout");
+_Static_assert(offsetof(cold_code_image_header_t, reserved) == 56u, "header layout");
+
+_Static_assert(offsetof(cold_code_image_t, image_id) == 0u, "runtime view layout");
+_Static_assert(offsetof(cold_code_image_t, slot_size) == 4u, "runtime view layout");
+_Static_assert(offsetof(cold_code_image_t, slot_count) == 8u, "runtime view layout");
+_Static_assert(offsetof(cold_code_image_t, max_pool_slots) == 12u, "runtime view layout");
+_Static_assert(offsetof(cold_code_image_t, arch) == 16u, "runtime view layout");
+_Static_assert(offsetof(cold_code_image_t, abi_version) == 20u, "runtime view layout");
+_Static_assert(offsetof(cold_code_image_t, struct_size) == 24u, "runtime view layout");
+_Static_assert(offsetof(cold_code_image_t, storage_align) == 28u, "runtime view layout");
+_Static_assert(offsetof(cold_code_image_t, name) == 32u, "runtime view layout");
+
+_Static_assert(offsetof(cold_code_image_info_t, image_id) == 0u, "info layout");
+_Static_assert(offsetof(cold_code_image_info_t, slot_size) == 4u, "info layout");
+_Static_assert(offsetof(cold_code_image_info_t, slot_count) == 8u, "info layout");
+_Static_assert(offsetof(cold_code_image_info_t, max_pool_slots) == 12u, "info layout");
+_Static_assert(offsetof(cold_code_image_info_t, arch) == 16u, "info layout");
+_Static_assert(offsetof(cold_code_image_info_t, abi_version) == 20u, "info layout");
+_Static_assert(offsetof(cold_code_image_info_t, storage_align) == 24u, "info layout");
+_Static_assert(offsetof(cold_code_image_info_t, payload_offset) == 28u, "info layout");
+_Static_assert(offsetof(cold_code_image_info_t, payload_size) == 32u, "info layout");
+_Static_assert(offsetof(cold_code_image_info_t, payload_crc32) == 36u, "info layout");
+_Static_assert(offsetof(cold_code_image_info_t, flags) == 40u, "info layout");
+_Static_assert(offsetof(cold_code_image_info_t, reserved) == 44u, "info layout");
+_Static_assert(sizeof(cold_code_image_info_t) == 48u, "info size");
 
 #define COLD_CODE_HEADER_CRC_OFFSET offsetof(cold_code_image_header_t, header_crc32)
+
+bool cold_code_image_info_valid(const cold_code_image_info_t *info) {
+    if (info == NULL) {
+        return false;
+    }
+    if (info->slot_size == 0u || info->slot_count == 0u || info->max_pool_slots == 0u ||
+        info->max_pool_slots > COLD_CODE_MAX_POOL_SLOTS ||
+        info->max_pool_slots > info->slot_count) {
+        return false;
+    }
+    if (info->storage_align == 0u || !cold_code_is_power_of_two(info->storage_align) ||
+        info->storage_align < _Alignof(cold_code_storage_header_t) ||
+        (info->slot_size % info->storage_align) != 0u) {
+        return false;
+    }
+    if (info->payload_offset != COLD_CODE_IMAGE_HEADER_SIZE) {
+        return false;
+    }
+    uint64_t expected_payload = (uint64_t)info->slot_size * (uint64_t)info->slot_count;
+    if (expected_payload > (uint64_t)UINT32_MAX ||
+        (uint64_t)info->payload_size != expected_payload) {
+        return false;
+    }
+    if ((info->flags & ~COLD_CODE_IMAGE_FLAG_PAYLOAD_CRC32) != 0u || info->reserved != 0u) {
+        return false;
+    }
+    return true;
+}
+
+bool cold_code_image_info_from_header(const cold_code_image_header_t *header, uint32_t source_size,
+                                      cold_code_image_info_t *out) {
+    if (header == NULL || out == NULL) {
+        return false;
+    }
+
+    cold_code_image_info_t info;
+    info.image_id = header->image_id;
+    info.slot_size = header->slot_size;
+    info.slot_count = header->slot_count;
+    info.max_pool_slots = header->max_pool_slots;
+    info.arch = header->arch;
+    info.abi_version = header->abi_version;
+    info.storage_align = header->storage_align;
+    info.payload_offset = header->payload_offset;
+    info.payload_size = header->payload_size;
+    info.payload_crc32 = header->payload_crc32;
+    info.flags = header->flags;
+    info.reserved = 0u;
+
+    if (!cold_code_image_info_valid(&info)) {
+        return false;
+    }
+    if ((uint64_t)info.payload_offset + (uint64_t)info.payload_size > (uint64_t)source_size) {
+        return false;
+    }
+
+    *out = info;
+    return true;
+}
+
+cold_code_image_t cold_code_image_view_from_info(const cold_code_image_info_t *info) {
+    cold_code_image_t view = {0};
+    if (info != NULL) {
+        view.image_id = info->image_id;
+        view.slot_size = info->slot_size;
+        view.slot_count = info->slot_count;
+        view.max_pool_slots = info->max_pool_slots;
+        view.arch = info->arch;
+        view.abi_version = info->abi_version;
+        view.struct_size = (uint32_t)sizeof(cold_code_image_t);
+        view.storage_align = info->storage_align;
+        view.name = NULL;
+    }
+    return view;
+}
 
 static void put_le16(unsigned char *dst, uint16_t value) {
     dst[0] = (unsigned char)(value & 0xFFu);
@@ -52,7 +153,7 @@ const char *cold_code_status_string(cold_code_status_t status) {
     case COLD_CODE_ERR_IMAGE:
         return "invalid cold image";
     case COLD_CODE_ERR_SOURCE:
-        return "image source error";
+        return "image loader error";
     case COLD_CODE_ERR_STATE:
         return "invalid manager state";
     case COLD_CODE_ERR_SIZE:
@@ -97,6 +198,10 @@ static void encode_header(const cold_code_image_header_t *header, unsigned char 
     put_le32(bytes + 36, header->payload_size);
     put_le32(bytes + 40, header->payload_crc32);
     put_le32(bytes + 44, header->flags);
+    put_le32(bytes + 48, 0u); /* header CRC is patched below */
+    put_le32(bytes + 52, header->storage_align);
+    put_le32(bytes + 56, 0u);
+    put_le32(bytes + 60, 0u);
 }
 
 cold_code_status_t cold_code_image_header_encode(const cold_code_image_header_t *header,
@@ -107,7 +212,11 @@ cold_code_status_t cold_code_image_header_encode(const cold_code_image_header_t 
     if (header->magic != COLD_CODE_IMAGE_MAGIC ||
         header->version != COLD_CODE_IMAGE_VERSION ||
         header->header_size != COLD_CODE_IMAGE_HEADER_SIZE ||
-        (header->flags & ~COLD_CODE_IMAGE_FLAG_PAYLOAD_CRC32) != 0u) {
+        (header->flags & ~COLD_CODE_IMAGE_FLAG_PAYLOAD_CRC32) != 0u ||
+        header->storage_align == 0u || !cold_code_is_power_of_two(header->storage_align) ||
+        header->storage_align < _Alignof(cold_code_storage_header_t) ||
+        (header->slot_size % header->storage_align) != 0u || header->reserved[0] != 0u ||
+        header->reserved[1] != 0u) {
         return COLD_CODE_ERR_ARG;
     }
 
@@ -141,13 +250,13 @@ cold_code_status_t cold_code_image_header_decode(const void *bytes, size_t size,
     header.payload_crc32 = get_le32(src + 40);
     header.flags = get_le32(src + 44);
     header.header_crc32 = get_le32(src + COLD_CODE_HEADER_CRC_OFFSET);
-    header.reserved[0] = get_le32(src + 52);
-    header.reserved[1] = get_le32(src + 56);
-    header.reserved[2] = get_le32(src + 60);
+    header.storage_align = get_le32(src + 52);
+    header.reserved[0] = get_le32(src + 56);
+    header.reserved[1] = get_le32(src + 60);
 
     if (header.magic != COLD_CODE_IMAGE_MAGIC || header.version != COLD_CODE_IMAGE_VERSION ||
         header.header_size != COLD_CODE_IMAGE_HEADER_SIZE || header.reserved[0] != 0u ||
-        header.reserved[1] != 0u || header.reserved[2] != 0u ||
+        header.reserved[1] != 0u ||
         (header.flags & ~COLD_CODE_IMAGE_FLAG_PAYLOAD_CRC32) != 0u) {
         return COLD_CODE_ERR_IMAGE;
     }

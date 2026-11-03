@@ -2,20 +2,19 @@
 #define COLD_CODE_H
 
 /*
- * cold_code v3 public API.
+ * cold_code v5 public API.
  *
- * Include this umbrella header from consumers.  The implementation-defined
- * manager layout is hidden; only the versioned fast-state ABI block and the
- * wire image header have fixed layouts.
+ * Include this umbrella header from consumers.  The manager layout is private;
+ * image metadata, loader callbacks and the per-CPU current manager are exposed
+ * through the headers below.
  */
 
-#include "cold_code/abi/v1.h"
 #include "cold_code/context.h"
 #include "cold_code/fault.h"
 #include "cold_code/image.h"
+#include "cold_code/loader.h"
 #include "cold_code/manager.h"
 #include "cold_code/port.h"
-#include "cold_code/source.h"
 #include "cold_code/stats.h"
 #include "cold_code/status.h"
 #include "cold_code/storage.h"

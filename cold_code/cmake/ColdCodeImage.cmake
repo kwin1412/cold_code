@@ -10,7 +10,6 @@ endif()
 #   NAME <identifier>
 #   SOURCES <cold sources...>
 #   [SLOT_SIZE <bytes>] [POOL_SLOTS <max>] [ARCH <name>]
-#   [STUBS SLOW|FAST] [FAST_PATH ON|OFF]   # FAST_PATH is a compatibility alias
 #   [OUTPUT_DIR <dir>] [RAM_SECTION ON|OFF] [VERIFY_RWX ON|OFF]
 #   [DEFINE_PATH ON|OFF] [COLD_FLAGS <flags...>]
 # )
@@ -41,7 +40,7 @@ function(cold_code_add_image target)
     set(duplicate_checker "${COLD_CODE_TOOL_DIR}/check_duplicate_symbols.py")
 
     cmake_parse_arguments(ARG ""
-        "NAME;SLOT_SIZE;POOL_SLOTS;ARCH;STUBS;FAST_PATH;OUTPUT_DIR;RAM_SECTION;VERIFY_RWX;DEFINE_PATH"
+        "NAME;SLOT_SIZE;POOL_SLOTS;ARCH;OUTPUT_DIR;RAM_SECTION;VERIFY_RWX;DEFINE_PATH"
         "SOURCES;COLD_FLAGS" ${ARGN})
     if(ARG_UNPARSED_ARGUMENTS)
         message(FATAL_ERROR
@@ -114,45 +113,6 @@ function(cold_code_add_image target)
     endif()
     separate_arguments(backend_cflags UNIX_COMMAND "${cflags_text}")
 
-    set(stubs_mode "${ARG_STUBS}")
-    if(ARG_FAST_PATH)
-        string(TOUPPER "${ARG_FAST_PATH}" fast_path_upper)
-        if(fast_path_upper STREQUAL "ON")
-            set(fast_alias FAST)
-        elseif(fast_path_upper STREQUAL "OFF")
-            set(fast_alias SLOW)
-        else()
-            message(FATAL_ERROR "cold_code_add_image: FAST_PATH must be ON or OFF")
-        endif()
-        if(stubs_mode AND NOT stubs_mode STREQUAL fast_alias)
-            message(FATAL_ERROR
-                "cold_code_add_image: STUBS and FAST_PATH disagree for ${ARG_NAME}")
-        endif()
-        set(stubs_mode "${fast_alias}")
-    endif()
-    if(NOT stubs_mode)
-        set(stubs_mode SLOW)
-    endif()
-    string(TOUPPER "${stubs_mode}" stubs_upper)
-    if(stubs_upper STREQUAL "FAST")
-        set(stubs_mode fast)
-        if(NOT backend_supports_fast)
-            message(FATAL_ERROR
-                "cold_code_add_image: arch '${ARG_ARCH}' does not support fast stubs")
-        endif()
-        if(NOT backend_fast_accessor)
-            message(FATAL_ERROR "cold_code_add_image: backend did not report a fast accessor")
-        endif()
-    elseif(stubs_upper STREQUAL "SLOW")
-        set(stubs_mode slow)
-        if(NOT backend_supports_slow)
-            message(FATAL_ERROR
-                "cold_code_add_image: arch '${ARG_ARCH}' does not support slow stubs")
-        endif()
-    else()
-        message(FATAL_ERROR "cold_code_add_image: STUBS must be SLOW or FAST")
-    endif()
-
     if(NOT ARG_SLOT_SIZE)
         set(ARG_SLOT_SIZE 4096)
     endif()
@@ -192,11 +152,6 @@ function(cold_code_add_image target)
     set(objects "${target}_${ARG_NAME}_cold_image_objects")
     set(image_ld "${COLD_CODE_LINKER_DIR}/${ARG_ARCH}/cold_image.ld")
     set(ram_ld "${COLD_CODE_LINKER_DIR}/${ARG_ARCH}/cold_ram_host.ld")
-    if(COLD_CODE_ARCH_INCLUDE_DIR)
-        set(arch_include_dir "${COLD_CODE_ARCH_INCLUDE_DIR}")
-    else()
-        set(arch_include_dir "${cold_code_dir}/src/arch/${ARG_ARCH}/include")
-    endif()
     if(NOT EXISTS "${image_ld}")
         message(FATAL_ERROR "cold_code_add_image: missing linker script ${image_ld}")
     endif()
@@ -223,8 +178,6 @@ function(cold_code_add_image target)
     set(cold_map "${ARG_OUTPUT_DIR}/cold_image_${ARG_NAME}.map")
     set(raw_bin "${ARG_OUTPUT_DIR}/cold_code_${ARG_NAME}_raw.bin")
     set(final_bin "${ARG_OUTPUT_DIR}/cold_code_${ARG_NAME}.bin")
-    set(gen_header "${ARG_OUTPUT_DIR}/cold_code_${ARG_NAME}_image.h")
-    set(gen_source "${ARG_OUTPUT_DIR}/cold_code_${ARG_NAME}_image.c")
     set(gen_stubs "${ARG_OUTPUT_DIR}/cold_code_${ARG_NAME}_stubs.S")
     set(layout_map "${ARG_OUTPUT_DIR}/cold_code_${ARG_NAME}_layout.map")
     set(symbols "${ARG_OUTPUT_DIR}/cold_code_${ARG_NAME}_symbols.txt")
@@ -255,14 +208,8 @@ function(cold_code_add_image target)
     file(GLOB public_headers "${COLD_CODE_INCLUDE_DIR}/cold_code.h"
         "${COLD_CODE_INCLUDE_DIR}/cold_code/*.h" "${COLD_CODE_INCLUDE_DIR}/cold_code/*/*.h")
     set(generator_deps "${elf}" "${raw_bin}" "${generator}" ${arch_py_files} ${public_headers})
-    if(stubs_mode STREQUAL "fast")
-        list(APPEND generator_deps
-            "${arch_include_dir}/cold_code/abi/v1/${ARG_ARCH}.h")
-    endif()
-
     set(generator_args
         --arch "${ARG_ARCH}"
-        --stubs-mode "${stubs_mode}"
         --nm "${CMAKE_NM}"
         --readelf "${CMAKE_READELF}"
         --objdump "${CMAKE_OBJDUMP}"
@@ -272,32 +219,25 @@ function(cold_code_add_image target)
         --image-name "${ARG_NAME}"
         --slot-size "${ARG_SLOT_SIZE}"
         --pool-slots "${ARG_POOL_SLOTS}"
-        --image-header "${gen_header}"
-        --image-source "${gen_source}"
         --stubs "${gen_stubs}"
         --layout-map "${layout_map}"
         --symbols "${symbols}"
     )
-    if(stubs_mode STREQUAL "fast")
-        list(APPEND generator_args --fast-accessor "${backend_fast_accessor}")
-    endif()
-
     add_custom_command(
-        OUTPUT "${final_bin}" "${gen_header}" "${gen_source}" "${gen_stubs}"
-               "${layout_map}" "${symbols}"
+        OUTPUT "${final_bin}" "${gen_stubs}" "${layout_map}" "${symbols}"
         COMMAND "${Python3_EXECUTABLE}" "${generator}" ${generator_args}
         DEPENDS ${generator_deps}
         COMMENT "Generating cold code stubs and image ${ARG_NAME}"
         VERBATIM
     )
 
-    target_sources(${target} PRIVATE "${gen_source}" "${gen_stubs}" "${gen_header}")
-    target_include_directories(${target} PRIVATE "${ARG_OUTPUT_DIR}")
-    if(EXISTS "${arch_include_dir}")
-        target_include_directories(${target} PRIVATE "${arch_include_dir}")
-    endif()
+    target_sources(${target} PRIVATE "${gen_stubs}")
     set_source_files_properties("${gen_stubs}" PROPERTIES LANGUAGE ASM)
     target_link_libraries(${target} PRIVATE cold_code::core)
+    target_compile_definitions(${target} PRIVATE
+        "COLD_CODE_IMAGE_${image_upper}_SLOT_SIZE=${ARG_SLOT_SIZE}"
+        "COLD_CODE_IMAGE_${image_upper}_MAX_POOL_SLOTS=${ARG_POOL_SLOTS}"
+        "COLD_CODE_IMAGE_${image_upper}_STORAGE_ALIGN=${backend_pool_alignment}")
     if(ARG_DEFINE_PATH)
         string(TOUPPER "${ARG_DEFINE_PATH}" define_path_upper)
         if(define_path_upper STREQUAL "ON")
@@ -310,8 +250,7 @@ function(cold_code_add_image target)
 
     set(gen_target "${target}_cold_code_gen_${ARG_NAME}")
     add_custom_target(${gen_target} DEPENDS
-        "${final_bin}" "${gen_header}" "${gen_source}" "${gen_stubs}" "${layout_map}"
-        "${symbols}")
+        "${final_bin}" "${gen_stubs}" "${layout_map}" "${symbols}")
     add_dependencies(${target} "${gen_target}")
 
     set(ram_section_on TRUE)

@@ -1,27 +1,21 @@
-#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 #include "cold_code.h"
 #include "cold_code_baremetal.h"
-#include "cold_code_baremetal_image.h"
+#include "test_cpu.h"
 #include "test_util.h"
 
-COLD_CODE_DEFINE_STORAGE(baremetal, g_storage_a);
-COLD_CODE_DEFINE_STORAGE(baremetal, g_storage_b);
+COLD_CODE_DEFINE_STORAGE(baremetal, g_storage_a, TEST_STORAGE_BYTES, TEST_STORAGE_ALIGN);
+COLD_CODE_DEFINE_STORAGE(baremetal, g_storage_b, TEST_STORAGE_BYTES, TEST_STORAGE_ALIGN);
 static cold_code_manager_t g_manager_a;
 static cold_code_manager_t g_manager_b;
-static cold_code_memory_source_t g_source;
+static cold_code_memory_loader_t g_source;
 
 uintptr_t cold_slot_address(void);
 
-static _Thread_local unsigned g_cpu;
-static _Thread_local unsigned g_sync_count;
-
-unsigned cold_code_baremetal_cpu_id(void) {
-    return g_cpu;
-}
+static unsigned g_sync_counts[2];
 
 static void baremetal_fatal(void *ctx, const char *message) {
     (void)ctx;
@@ -36,25 +30,26 @@ static void baremetal_sync(void *ctx, void *addr, size_t size) {
     (void)ctx;
     (void)addr;
     (void)size;
-    ++g_sync_count;
+    uint32_t cpu = test_cpu();
+    if (cpu < 2u) {
+        ++g_sync_counts[cpu];
+    }
 }
 
 typedef struct {
     cold_code_manager_t *manager;
-    unsigned cpu;
+    uint32_t cpu;
     uintptr_t address;
     int ok;
 } worker_t;
 
-static void *worker(void *arg) {
-    worker_t *work = (worker_t *)arg;
+static void run_worker(worker_t *work) {
     int ok = 1;
 
-    g_cpu = work->cpu;
-    g_sync_count = 0u;
-    if (cold_code_manager_activate(work->manager) != COLD_CODE_OK) {
+    test_set_cpu(work->cpu);
+    if (cold_code_manager_current() != work->manager) {
         work->ok = 0;
-        return NULL;
+        return;
     }
 
     uintptr_t address = cold_slot_address();
@@ -63,7 +58,7 @@ static void *worker(void *arg) {
     if (image == NULL || address < pool || address - pool >= image->slot_size) {
         ok = 0;
     }
-    if (cold_slot_address() != address || g_sync_count != 1u) {
+    if (cold_slot_address() != address || g_sync_counts[work->cpu] != 1u) {
         ok = 0;
     }
 
@@ -77,10 +72,8 @@ static void *worker(void *arg) {
         ok = 0;
     }
 
-    cold_code_manager_activate(NULL);
     work->address = address;
     work->ok = ok;
-    return NULL;
 }
 
 static unsigned char *read_file(const char *path, size_t *size_out) {
@@ -114,7 +107,6 @@ static unsigned char *read_file(const char *path, size_t *size_out) {
 
 int main(void) {
     cold_code_baremetal_config_t port_config = {
-        .core_count = 2u,
         .fatal = baremetal_fatal,
         .fatal_ctx = NULL,
         .sync_code = baremetal_sync,
@@ -126,36 +118,39 @@ int main(void) {
     unsigned char *image_data = read_file(COLD_CODE_IMAGE_BAREMETAL_PATH, &image_size);
     CHECK(image_data != NULL);
 
-    cold_code_memory_source_init(&g_source, image_data, image_size);
-    cold_code_source_t source = cold_code_memory_source(&g_source);
+    cold_code_memory_loader_init(&g_source, image_data, image_size);
+    cold_code_loader_t loader = cold_code_memory_loader(&g_source);
+    cold_code_image_info_t info;
+    CHECK(test_probe_ok(loader, 1u, sizeof(g_storage_a), &info));
     cold_code_manager_config_t config = {
-        .image = &cold_code_image_baremetal,
-        .storage = &g_storage_a,
-        .storage_size = sizeof(g_storage_a),
+        .loader = loader,
+        .exec_addr = &g_storage_a,
+        .exec_size = sizeof(g_storage_a),
+        .cpuid = 0u,
+        .context = &cold_code_baremetal_context_ops,
         .pool_slots = 1u,
-        .source = source,
-        .flags = COLD_CODE_INIT_VERIFY_CRC,
+        .expected_image_id = info.image_id,
+        .flags = COLD_CODE_INIT_VERIFY_CRC | COLD_CODE_INIT_EXPECT_IMAGE_ID,
     };
+    test_set_cpu(0u);
     CHECK_EQ(cold_code_manager_init(&g_manager_a, &config), COLD_CODE_OK);
-    config.storage = &g_storage_b;
-    config.storage_size = sizeof(g_storage_b);
+    config.exec_addr = &g_storage_b;
+    config.exec_size = sizeof(g_storage_b);
+    config.cpuid = 1u;
     CHECK_EQ(cold_code_manager_init(&g_manager_b, &config), COLD_CODE_OK);
-    CHECK(cold_code_manager_current() == NULL);
 
     worker_t work_a = {.manager = &g_manager_a, .cpu = 0u, .address = 0, .ok = 0};
     worker_t work_b = {.manager = &g_manager_b, .cpu = 1u, .address = 0, .ok = 0};
-    pthread_t thread_a;
-    pthread_t thread_b;
-    CHECK_EQ(pthread_create(&thread_a, NULL, worker, &work_a), 0);
-    CHECK_EQ(pthread_create(&thread_b, NULL, worker, &work_b), 0);
-    CHECK_EQ(pthread_join(thread_a, NULL), 0);
-    CHECK_EQ(pthread_join(thread_b, NULL), 0);
+    run_worker(&work_a);
+    run_worker(&work_b);
 
     CHECK(work_a.ok);
     CHECK(work_b.ok);
     CHECK(work_a.address != work_b.address);
     CHECK_EQ(work_a.address - (uintptr_t)cold_code_manager_pool_base(&g_manager_a),
              work_b.address - (uintptr_t)cold_code_manager_pool_base(&g_manager_b));
+    CHECK_EQ(g_sync_counts[0], 1u);
+    CHECK_EQ(g_sync_counts[1], 1u);
 
     cold_code_stats_t stats;
     CHECK_EQ(cold_code_manager_stats(&g_manager_a, &stats), COLD_CODE_OK);
@@ -165,8 +160,18 @@ int main(void) {
     CHECK_EQ(stats.loads, 1u);
     CHECK_EQ(stats.hits, 1u);
 
+    test_set_cpu(1u);
     CHECK_EQ(cold_code_manager_deinit(&g_manager_a), COLD_CODE_OK);
+    CHECK(cold_code_manager_current() == &g_manager_b);
+    test_set_cpu(0u);
+    CHECK(cold_code_manager_current() == NULL);
     CHECK_EQ(cold_code_manager_deinit(&g_manager_b), COLD_CODE_OK);
+    test_set_cpu(1u);
+    CHECK(cold_code_manager_current() == NULL);
+
+    config.cpuid = COLD_CODE_MAX_CPUS;
+    CHECK_EQ(cold_code_manager_init(&g_manager_a, &config), COLD_CODE_ERR_ARG);
+
     free(image_data);
     TEST_OK();
     return 0;

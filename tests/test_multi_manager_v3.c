@@ -1,17 +1,16 @@
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 #include "cold_code.h"
 #include "cold_code_host.h"
-#include "cold_code_multi_image.h"
+#include "test_cpu.h"
 #include "test_util.h"
 
-COLD_CODE_DEFINE_STORAGE(multi, g_storage_a);
-COLD_CODE_DEFINE_STORAGE(multi, g_storage_b);
+COLD_CODE_DEFINE_STORAGE(multi, g_storage_a, TEST_STORAGE_BYTES, TEST_STORAGE_ALIGN);
+COLD_CODE_DEFINE_STORAGE(multi, g_storage_b, TEST_STORAGE_BYTES, TEST_STORAGE_ALIGN);
 static cold_code_manager_t g_manager_a;
 static cold_code_manager_t g_manager_b;
-static cold_code_memory_source_t g_source;
+static cold_code_memory_loader_t g_source;
 
 int cold_multi_add(int lhs, int rhs);
 int cold_multi_sub(int lhs, int rhs);
@@ -19,21 +18,22 @@ int cold_multi_mul(int lhs, int rhs);
 
 typedef struct {
     cold_code_manager_t *manager;
+    uint32_t cpu;
     int iterations;
     int ok;
 } worker_t;
 
-static void *worker(void *arg) {
-    worker_t *work = (worker_t *)arg;
+static void run_worker(worker_t *work) {
     int ok = 1;
 
-    if (cold_code_manager_activate(work->manager) != COLD_CODE_OK) {
+    test_set_cpu(work->cpu);
+    if (cold_code_manager_current() != work->manager) {
         work->ok = 0;
-        return NULL;
+        return;
     }
     for (int i = 0; i < work->iterations; ++i) {
-        if (cold_multi_add(2, 3) != 5 || cold_multi_sub(5, 3) != 2 || cold_multi_mul(4, 3) != 12 ||
-            cold_multi_add(2, 3) != 5) {
+        if (cold_multi_add(2, 3) != 5 || cold_multi_sub(5, 3) != 2 ||
+            cold_multi_mul(4, 3) != 12 || cold_multi_add(2, 3) != 5) {
             ok = 0;
             break;
         }
@@ -52,9 +52,7 @@ static void *worker(void *arg) {
         }
     }
 
-    cold_code_manager_activate(NULL);
     work->ok = ok;
-    return NULL;
 }
 
 static unsigned char *read_file(const char *path, size_t *size_out) {
@@ -91,35 +89,37 @@ int main(void) {
     unsigned char *image_data = read_file(COLD_CODE_IMAGE_MULTI_PATH, &image_size);
     CHECK(image_data != NULL);
 
-    cold_code_memory_source_init(&g_source, image_data, image_size);
-    cold_code_source_t source = cold_code_memory_source(&g_source);
+    cold_code_memory_loader_init(&g_source, image_data, image_size);
+    cold_code_loader_t loader = cold_code_memory_loader(&g_source);
+    cold_code_image_info_t info;
+    CHECK(test_probe_ok(loader, 1u, sizeof(g_storage_a), &info));
     cold_code_manager_config_t config = {
-        .image = &cold_code_image_multi,
-        .storage = NULL,
-        .storage_size = 0u,
+        .loader = loader,
+        .exec_addr = &g_storage_a,
+        .exec_size = sizeof(g_storage_a),
+        .cpuid = 0u,
+        .context = &cold_code_host_context_ops,
         .pool_slots = 1u,
-        .source = source,
-        .flags = COLD_CODE_INIT_VERIFY_CRC,
+        .expected_image_id = info.image_id,
+        .flags = COLD_CODE_INIT_VERIFY_CRC | COLD_CODE_INIT_EXPECT_IMAGE_ID,
     };
 
-    config.storage = &g_storage_a;
-    config.storage_size = sizeof(g_storage_a);
+    test_set_cpu(0u);
+    CHECK(cold_code_manager_current() == NULL);
     CHECK_EQ(cold_code_manager_init(&g_manager_a, &config), COLD_CODE_OK);
-    config.storage = &g_storage_b;
-    config.storage_size = sizeof(g_storage_b);
+    CHECK(cold_code_manager_current() == &g_manager_a);
+    config.exec_addr = &g_storage_b;
+    config.exec_size = sizeof(g_storage_b);
+    config.cpuid = 1u;
     CHECK_EQ(cold_code_manager_init(&g_manager_b, &config), COLD_CODE_OK);
-    CHECK(cold_code_manager_current() == NULL);
+    CHECK(cold_code_manager_current() == &g_manager_a);
+    test_set_cpu(1u);
+    CHECK(cold_code_manager_current() == &g_manager_b);
 
-    worker_t work_a = {.manager = &g_manager_a, .iterations = 10, .ok = 0};
-    worker_t work_b = {.manager = &g_manager_b, .iterations = 3, .ok = 0};
-    pthread_t thread_a;
-    pthread_t thread_b;
-    CHECK_EQ(pthread_create(&thread_a, NULL, worker, &work_a), 0);
-    CHECK_EQ(pthread_create(&thread_b, NULL, worker, &work_b), 0);
-    CHECK_EQ(pthread_join(thread_a, NULL), 0);
-    CHECK_EQ(pthread_join(thread_b, NULL), 0);
-
-    CHECK(cold_code_manager_current() == NULL);
+    worker_t work_a = {.manager = &g_manager_a, .cpu = 0u, .iterations = 10, .ok = 0};
+    worker_t work_b = {.manager = &g_manager_b, .cpu = 1u, .iterations = 3, .ok = 0};
+    run_worker(&work_a);
+    run_worker(&work_b);
     CHECK(work_a.ok);
     CHECK(work_b.ok);
 
@@ -140,8 +140,15 @@ int main(void) {
     CHECK_EQ(stats.evictions, 6u);
     CHECK_EQ(stats.hits, 5u);
 
+    test_set_cpu(1u);
     CHECK_EQ(cold_code_manager_deinit(&g_manager_a), COLD_CODE_OK);
+    CHECK(cold_code_manager_current() == &g_manager_b);
+    test_set_cpu(0u);
+    CHECK(cold_code_manager_current() == NULL);
     CHECK_EQ(cold_code_manager_deinit(&g_manager_b), COLD_CODE_OK);
+    test_set_cpu(1u);
+    CHECK(cold_code_manager_current() == NULL);
+
     free(image_data);
     TEST_OK();
     return 0;

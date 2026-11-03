@@ -21,6 +21,7 @@ typedef enum {
 typedef struct {
     cold_code_fault_code_t code;
     const cold_code_manager_t *manager;
+    /* Manager-owned runtime view loaded from the wire header. */
     const cold_code_image_t *image;
     uint32_t image_slot;
     const char *message;
@@ -29,7 +30,7 @@ typedef struct {
 /*
  * Called before the context port's fatal handler.  The callback must return
  * normally or terminate; longjmp-ing out of the loader leaves residency state
- * inconsistent.  If it returns, the core calls cold_code_context_ops.fatal().
+ * inconsistent.  If it returns, the core calls the manager context fatal().
  */
 typedef void (*cold_code_fault_fn)(void *ctx, const cold_code_fault_info_t *fault);
 

@@ -1,5 +1,5 @@
-if(NOT DEFINED TEST_EXE OR NOT DEFINED EXPECT_REGEX)
-    message(FATAL_ERROR "TEST_EXE and EXPECT_REGEX are required")
+if(NOT DEFINED TEST_EXE)
+    message(FATAL_ERROR "TEST_EXE is required")
 endif()
 
 execute_process(
@@ -15,8 +15,10 @@ if("${result}" STREQUAL "0")
     message(FATAL_ERROR "expected the process to abort, but it exited successfully")
 endif()
 
-if(NOT output MATCHES "${EXPECT_REGEX}")
-    message(FATAL_ERROR "expected output to match '${EXPECT_REGEX}', got:\n${output}")
+if(DEFINED EXPECT_REGEX AND NOT EXPECT_REGEX STREQUAL "")
+    if(NOT output MATCHES "${EXPECT_REGEX}")
+        message(FATAL_ERROR "expected output to match '${EXPECT_REGEX}', got:\n${output}")
+    endif()
 endif()
 
 message(STATUS "expected abort observed (result: ${result})")

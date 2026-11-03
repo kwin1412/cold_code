@@ -3,16 +3,13 @@
 
 #include "cold_code.h"
 
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#ifndef COLD_CODE_BAREMETAL_MAX_CORES
-#define COLD_CODE_BAREMETAL_MAX_CORES 8u
-#endif
-
 typedef struct {
-    uint32_t core_count;
     void (*fatal)(void *ctx, const char *message);
     void *fatal_ctx;
     void (*sync_code)(void *ctx, void *addr, size_t size);
@@ -20,12 +17,15 @@ typedef struct {
 } cold_code_baremetal_config_t;
 
 /*
- * Install the per-core context backend.  Call before initializing managers.
- * cpu_id() is a weak symbol returning 0; provide a strong definition when the
- * target has more than one core.
+ * Install fatal/cache-sync hooks used by cold_code_baremetal_context_ops.
+ * Call before initializing managers.  The target must also provide a strong
+ * cold_code_cpu_id() (for example reading MPIDR/COREID); the core weak default
+ * is 0.  A CPU must return a stable id below COLD_CODE_MAX_CPUS.
  */
 void cold_code_baremetal_init(const cold_code_baremetal_config_t *config);
-unsigned cold_code_baremetal_cpu_id(void);
+
+/* Pass &cold_code_baremetal_context_ops in manager_config.context. */
+extern const cold_code_context_ops_t cold_code_baremetal_context_ops;
 
 #ifdef __cplusplus
 }

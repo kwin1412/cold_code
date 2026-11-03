@@ -1,6 +1,10 @@
-# v2 → v3 migration
+# v2 → v3 migration（历史）
 
-> 完整架构、设计权衡与路线图见 [技术报告](technical-report.md)。
+> v5 已删除 `cold_code_manager_activate()`、source 和 FAST；本文仅描述 v3。
+> 当前迁移见 [migration-v4-v5.md](migration-v4-v5.md)。
+
+> 完整架构、设计权衡与路线图见 [技术报告](technical-report.md)。v3 → v4 迁移见
+> [migration-v3-v4.md](migration-v3-v4.md)。
 
 v3 是 breaking redesign，不提供 v2 兼容层。仓库内 example/tests/consumer 已全部迁移。
 
@@ -19,7 +23,7 @@ v3 是 breaking redesign，不提供 v2 兼容层。仓库内 example/tests/cons
 | `cold_code_storage_<n>_t` 可见字段 | 不透明字节 storage 类型 |
 | 36 字节 native-endian image v2 | 64 字节小端 image v3 + header CRC |
 | `POOL_SLOTS` 固定在 image | 生成上限 + 每 manager `config.pool_slots` |
-| 复制 descriptor 可用 | 必须使用生成的 descriptor 对象（指针身份） |
+| 复制 descriptor 可用 | 必须使用生成的 descriptor 对象（对象地址身份） |
 | 每个 consumer 复制 host port | 链接 `cold_code::host` / `cold_code::baremetal` |
 | 顶层必须 `LANGUAGES C ASM` | 库/helper 自动启用 ASM |
 | 无 install/find_package | `install(EXPORT ...)` + `find_package(cold_code CONFIG)` |
@@ -34,7 +38,11 @@ v3 是 breaking redesign，不提供 v2 兼容层。仓库内 example/tests/cons
 - `POOL_SLOTS` 是生成 storage 容量上限；config `pool_slots` 可更小，0 表示上限；
   显式超限返回 `ERR_ARG`。
 - image header 必须提供 header CRC/arch/ABI/payload size；payload CRC flag 由生成器设置。
-- descriptor 指针身份校验：复制 descriptor 会导致冷调用 fault。
+- descriptor 对象地址身份校验：复制 descriptor 会导致冷调用 fault。
+- 生成的 `_image.h` 定义每 image 的 `cold_code_<name>_image_t`
+  （`COLD_CODE_IMAGE_FIELDS` 前缀）和 `cold_code_image_<name>` 对象；config
+  `image` 是 `cold_code_image_handle_t`，`cold_code_manager_image()` 返回 core
+  缓存的公共视图，不是原对象地址。
 - context port 统一 fatal 路径；manager fault callback 返回后一定调用 port fatal。
 - storage 实际段由 `COLD_CODE_DEFINE_STORAGE` 的 marker 校验；手写 storage 会只得到
   warning。

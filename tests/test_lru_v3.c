@@ -8,15 +8,11 @@
 #endif
 
 #if EXPECTED_POOL == 2
-#include "cold_code_lru2_image.h"
-#define TEST_IMAGE      cold_code_image_lru2
 #define TEST_IMAGE_PATH COLD_CODE_IMAGE_LRU2_PATH
-COLD_CODE_DEFINE_STORAGE(lru2, g_storage);
+COLD_CODE_DEFINE_STORAGE(lru2, g_storage, TEST_STORAGE_BYTES, TEST_STORAGE_ALIGN);
 #else
-#include "cold_code_lru1_image.h"
-#define TEST_IMAGE      cold_code_image_lru1
 #define TEST_IMAGE_PATH COLD_CODE_IMAGE_LRU1_PATH
-COLD_CODE_DEFINE_STORAGE(lru1, g_storage);
+COLD_CODE_DEFINE_STORAGE(lru1, g_storage, TEST_STORAGE_BYTES, TEST_STORAGE_ALIGN);
 #endif
 
 static cold_code_manager_t g_manager;
@@ -35,20 +31,24 @@ static cold_code_stats_t stats(void) {
 }
 
 int main(void) {
-    cold_code_file_source_t file;
-    cold_code_file_source_init(&file, TEST_IMAGE_PATH);
+    cold_code_file_loader_t file;
+    cold_code_file_loader_init(&file, TEST_IMAGE_PATH);
+    cold_code_loader_t source = cold_code_file_loader(&file);
+    cold_code_image_info_t info;
+    CHECK(test_probe_ok(source, EXPECTED_POOL, sizeof(g_storage), &info));
 
     cold_code_manager_config_t config = {
-        .image = &TEST_IMAGE,
-        .storage = &g_storage,
-        .storage_size = sizeof(g_storage),
+        .exec_addr = &g_storage,
+        .exec_size = sizeof(g_storage),
+        .cpuid = 0u,
+        .context = &cold_code_host_context_ops,
         .pool_slots = EXPECTED_POOL,
-        .source = cold_code_file_source(&file),
-        .flags = COLD_CODE_INIT_VERIFY_CRC,
+        .expected_image_id = info.image_id,
+        .loader = source,
+        .flags = COLD_CODE_INIT_VERIFY_CRC | COLD_CODE_INIT_EXPECT_IMAGE_ID,
         .trace = {.fn = test_trace_event, .ctx = NULL},
     };
     CHECK_EQ(cold_code_manager_init(&g_manager, &config), COLD_CODE_OK);
-    CHECK_EQ(cold_code_manager_activate(&g_manager), COLD_CODE_OK);
 
     CHECK_EQ(stats().image_slots, 3u);
     CHECK_EQ(stats().pool_slots, EXPECTED_POOL);
@@ -80,6 +80,7 @@ int main(void) {
 #endif
 
     CHECK_EQ(cold_code_manager_deinit(&g_manager), COLD_CODE_OK);
+    cold_code_file_loader_close(&file);
     TEST_OK();
     return 0;
 }

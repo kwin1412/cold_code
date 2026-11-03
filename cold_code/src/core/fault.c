@@ -4,14 +4,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-const cold_code_context_ops_t *cold_code_context_ops_checked(void) {
-    const cold_code_context_ops_t *ops = &cold_code_context_ops;
-    if (ops->abi_version != COLD_CODE_CONTEXT_ABI_VERSION ||
-        ops->struct_size < (uint32_t)sizeof(*ops) || ops->current == NULL ||
-        ops->set_current == NULL || ops->fatal == NULL) {
-        return NULL;
-    }
-    return ops;
+bool cold_code_context_ops_valid(const cold_code_context_ops_t *ops) {
+    return ops != NULL && ops->abi_version == COLD_CODE_CONTEXT_ABI_VERSION &&
+           ops->struct_size >= (uint32_t)sizeof(*ops) && ops->fatal != NULL;
 }
 
 bool cold_code_context_arch_valid(const cold_code_context_ops_t *ops) {
@@ -40,18 +35,19 @@ _Noreturn void cold_code_core_fatal(struct cold_code_manager_impl *manager,
             cold_code_fault_info_t info = {
                 .code = code,
                 .manager = (const cold_code_manager_t *)manager,
-                .image = manager->fast.image,
+                .image = &manager->image_view,
                 .image_slot = image_slot,
                 .message = message,
             };
             manager->fault.fn(manager->fault.ctx, &info);
         }
+        if (manager->context != NULL && manager->context->fatal != NULL) {
+            manager->context->fatal(message != NULL ? message : "cold_code: fatal loader error");
+        }
     }
 
-    const cold_code_context_ops_t *ops = cold_code_context_ops_checked();
-    if (ops != NULL) {
-        ops->fatal(message != NULL ? message : "cold_code: fatal loader error");
-    }
+    /* No manager/context is available (for example before init). */
+    __builtin_trap();
     for (;;) {
         /* A port violated the fatal() contract; do not return into the loader. */
     }

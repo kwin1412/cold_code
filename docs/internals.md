@@ -1,130 +1,161 @@
-# cold_code v3 internals
+# cold_code internals (v5)
 
-> 完整架构、设计权衡与路线图见 [技术报告](technical-report.md)。
+> 完整架构、权衡与证据见[技术报告](technical-report.md)。
 
-## 分层
+`cold_code::core` 是 freestanding loader，不依赖 libc、OS 动态加载或任何具体 port。
+平台相关的 context ops、loader 和可执行内存都由 `cold_code_manager_config_t`
+传入；core 维护 per-CPU manager 表，所有调用统一走 slow stub。
 
-```text
-cold_code::core (freestanding)
-  manager lifecycle / storage carving / image validation / LRU / fault
-        │ extern const cold_code_context_ops
-        ▼
-context port
-  current manager + fatal + optional code cache sync
-        │
-        ▼
-generated stubs (x86-64)
-  slow: save args -> cold_code_core_acquire_slot_v1(image, slot) -> jump
-  fast: accessor -> fast-state checks/LRU update -> jump
-```
-
-core 不包含 port 实现，也不读取 thread/core id；它提供平台无关的 memory source
-实现。fast-state 块是唯一固定布局的 manager 前缀；其余 manager 字段对消费者不可见。
-
-## Manager 实现
-
-`struct cold_code_manager_impl` 以 `cold_code_fast_state_t fast` 开始，随后是：
-
-- storage header 指针、`way_slot` 指针；
-- source ops/ctx；
-- slot_count、payload offset/size、flags、manager magic；
-- trace/fault 回调；
-- loads/evictions/misses/faults 计数（hits 在 fast-state 中）。
-
-`_Static_assert` 保证：
-
-- `offsetof(impl, fast) == 0`；
-- `sizeof(impl) <= COLD_CODE_MANAGER_BYTES`；
-- `_Alignof(impl) <= COLD_CODE_MANAGER_ALIGN`。
-
-manager init 顺序：
-
-1. 参数、manager magic、image geometry/ABI。
-2. context ops ABI/struct_size/arch。
-3. source ops、pool_slots 解析、storage size/alignment。
-4. storage header magic/ABI/owner 检查，claim owner（失败回滚）。
-5. source open、读取 64 字节 header、decode + header CRC。
-6. descriptor/header 字段一致性、payload 范围、可选 payload CRC。
-7. 设置 payload 信息、manager magic、fast-state READY。
-
-## Storage 布局
-
-```text
-cold_code_storage_header_t
-pool[pool_slots][slot_size]       (aligned to image->storage_align)
-slot_map[slot_count]              way+1; 0 = not resident
-way_slot[pool_slots]              image slot; UINT32_MAX = free
-way_used[pool_slots]              LRU tick
-```
-
-`COLD_CODE_STORAGE_SIZE(slot_count, pool_slots, slot_size, align)` 与
-`COLD_CODE_STORAGE_*_OFFSET` 宏是 core 和生成 header 的单一事实来源。init 校验实际
-storage 大小/对齐/owner；deinit 清除 owner/magic，允许用不同 pool_slots 复用。
-
-## Slot/LRU
-
-- `slot_map[slot] = way + 1`；hit 刷新 `tick` 和 `hits`。
-- miss：`misses++`，选第一个 free way，否则最小 `way_used` victim；
-  - victim：清旧 slot_map、`evictions++`、trace EVICT；
-  - 读整个 slot 到 way base；
-  - 调 `sync_code`；
-  - 提交 way_slot/slot_map/way_used、`loads++`、trace LOAD。
-- 无 function ID；stub 携带 descriptor 指针、image slot、intra offset。
-- descriptor 指针身份校验防止不同 image / 复制 descriptor 误用。
-
-## Image v3 wire format
-
-- 64 字节 header，全部多字节字段小端；core 用逐字节解码，不 overlay struct。
-- header 覆盖 magic/version/header_size/image_id/arch/abi/slot_size/slot_count/
-  max_pool_slots/payload_offset/payload_size/payload_crc32/flags/header_crc32/
-  reserved。
-- `header_size == 64`、`payload_offset == 64`；payload 紧跟 header。
-- `header_crc32` 覆盖完整 64 字节 header（该字段先置 0）。
-- `flags` bit0 表示 payload CRC 存在；未知 flag/reserved 非零会被拒绝。
-- payload CRC 只检测损坏，不是认证。
-
-## Fast-state ABI
+## 1. 配置与所有权
 
 ```c
 typedef struct {
-    const cold_code_image_t *image;  /* 0 */
-    uint32_t *slot_map;              /* 8 */
-    uint64_t *way_used;              /* 16 */
-    unsigned char *pool;             /* 24 */
-    uint32_t pool_slots;             /* 32 */
-    uint32_t state;                  /* 36 bit0 READY */
-    uint64_t tick;                   /* 40 */
-    uint64_t hits;                   /* 48 */
-} cold_code_fast_state_t;
+    cold_code_loader_t loader;
+    void *exec_addr;
+    size_t exec_size;
+    uint32_t cpuid;
+    const cold_code_context_ops_t *context;
+    uint32_t pool_slots;
+    uint32_t expected_image_id;
+    uint32_t flags;
+    cold_code_trace_t trace;
+    cold_code_fault_t fault;
+} cold_code_manager_config_t;
 ```
 
-- x86-64 数字 offset 在
-  `src/arch/x86_64/include/cold_code/abi/v1/x86_64.h`。
-- 生成 `.S` 经过预处理器，直接 `#include` 该头并使用宏；Python 不再解析 offset。
-- `abi_check.c` 用 `offsetof`/`_Static_assert` 锁定布局。
-- 生成 fast stub：accessor -> READY/image 指针/slot_map/way 检查 -> tick/way_used/
-  hits 更新 -> 计算 `pool + way*slot_size + intra` -> 尾跳。miss/异常落回慢路径。
+- manager 必须零初始化；一个 CPU 一个 manager。
+- `loader` 按值复制；`load_ctx`、`context`、`exec_addr` 必须比 manager 活得久。
+- `exec_addr/exec_size` 是调用方可执行 RAM；core 按 image header 的
+  `storage_align` 和 probe 结果校验大小/对齐，并切分 storage header、slot_map、
+  way_slot、way_used、pool。
+- manager 不拥有 loader；host file loader 由调用方在 deinit 后关闭。
 
-## Slow stub ABI
+## 2. Loader
 
-- 保存完整 `%rax`（含 AL）、`rdi/rsi/rdx/rcx/r8/r9` 和 `xmm0-7`，栈参数不动。
-- `leaq cold_code_image_<name>(%rip), %rdi`；`mov $slot, %esi`；
-  `call cold_code_core_acquire_slot_v1`；恢复参数；`add $intra, %r11`；`jmp *%r11`。
-- 入口 `endbr64`；冷函数由 `-fcf-protection=branch` 生成 `endbr64`。
-- `cold_code_core_acquire_slot_v1` 是版本化符号；ABI 变更时改符号名，让旧生成
-  stub 在链接期失败。
+```c
+typedef bool (*cold_code_load_fn)(void *ctx, uint32_t offset, void *dst, size_t size);
 
-## Fault 路径
+typedef struct {
+    cold_code_load_fn load_fptr;
+    void *load_ctx;
+    uint32_t image_size;
+} cold_code_loader_t;
+```
 
-- manager 配置了 fault callback：core 填充 `cold_code_fault_info_t`
-  （code/manager/image/slot/message），先回调；返回后调用 context port `fatal`。
-- 无 current manager：直接调用 context port `fatal`。
-- fault callback 不应 longjmp；loader 可能处于部分更新状态。
-- `fatal` 不得返回；core 在返回后进入死循环作为最后防线。
+- `load_fptr` 必须支持重复/随机读；越界或 short read 返回 false。
+- probe 只读 header；init 重新读 header，并在 `VERIFY_CRC` 时按 512 字节块读取
+  payload。
+- loader 可被多个 manager/CPU 共享；共享时必须可重入，或每个 manager 使用独立
+  loader。
+- core 提供 `cold_code_memory_loader_t`（无 libc）；host 提供一次性读入文件的
+  `cold_code_file_loader_t`。
 
-## Freestanding 约束
+## 3. Context ops
 
-- core 与 baremetal port 以 `-ffreestanding -fno-builtin -fno-stack-protector
-  -fno-tree-loop-distribute-patterns` 编译。
-- 不使用 `memcpy/memset/malloc/stdio`；header 编解码和 memory source 使用显式循环。
-- 可用 `nm -u` 检查目标文件未引入 libc 符号。
+```c
+typedef struct cold_code_context_ops {
+    uint32_t abi_version; /* COLD_CODE_CONTEXT_ABI_VERSION == 2 */
+    uint32_t struct_size;
+    uint32_t arch;
+    void (*fatal)(const char *message);
+    void (*sync_code)(void *addr, size_t size);
+} cold_code_context_ops_t;
+```
+
+- manager 保存 `config.context`；init 校验 ABI/struct_size/arch/fatal。
+- 不再是全局单例：host、baremetal、custom ops 可同时链接，由每个 manager 选择。
+- `fatal` 不得返回；`sync_code` 在 slot 读入 pool 后、标记 resident 前调用，
+  用于 D-cache clean + I-cache invalidate。
+- 多个 CPU 可能并发调用 `fatal/sync_code`；port 实现应可重入。
+
+## 4. Per-CPU manager 表与 CPU hook
+
+```c
+#define COLD_CODE_MAX_CPUS 64u
+uint32_t cold_code_cpu_id(void); /* weak default 0 */
+cold_code_manager_t *cold_code_manager_current(void);
+```
+
+- core 内部 `static cold_code_manager_t *g_managers[COLD_CODE_MAX_CPUS]`。
+- 多 CPU 应用/target 提供强 `cold_code_cpu_id()`；host 测试用普通全局变量，
+  裸机读 MPIDR/COREID 等。返回值必须 `< COLD_CODE_MAX_CPUS`。
+- `cold_code_manager_current()` 查 `g_managers[cold_code_cpu_id()]`，
+  越界返回 NULL；只读。
+- 不同 CPU 操作不同表项；无锁。同一 CPU 的并发 init/deinit 不支持；跨 CPU 发布
+  manager 时调用方需提供发布屏障。
+
+## 5. Manager 私有状态
+
+manager 的 public 类型只是 `COLD_CODE_MANAGER_BYTES` 的不透明字节。实现内部保存：
+
+- `cold_code_manager_state_t`：image_id、slot_map、way_used、pool、pool_slots、
+  state、tick、hits；
+- loader、context、exec_addr/exec_size、slot_count、payload_offset/size、
+  flags、cpuid、magic；
+- trace/fault、loads/evictions/misses/faults、runtime image view。
+
+没有 public fast-state ABI，也没有固定 offset 承诺；`COLD_CODE_ABI_VERSION`
+仍为 2，slow stub 不直接访问 manager 内部。
+
+## 6. init / deinit
+
+init 顺序：
+
+1. 校验 manager/config、loader/load_fptr/image_size、exec/context/cpuid。
+2. 校验 context ABI/struct_size/arch/fatal。
+3. 早期检查 exec storage header 的 magic/ABI/owner/对齐。
+4. 通过 loader 读 64 字节 header，decode/CRC/geometry/payload 范围。
+5. expected_image_id、image ABI、image arch vs context arch。
+6. resolve pool_slots，计算 layout，校验 exec size/alignment。
+7. claim storage header owner。
+8. 可选 payload CRC。
+9. 填私有状态/runtime view/residency。
+10. 设置 manager magic + READY。
+11. **最后**绑定 `g_managers[cpuid]`；若已被占用返回 `ERR_STATE`；绑定是最后一个
+    可能失败的步骤。
+
+失败路径：release exec storage、清零 manager；不关闭 loader；不解除其他 CPU 的
+绑定。deinit 只清除自己的 `g_managers[cpuid]`，然后释放 exec storage、清零 manager。
+
+## 7. Slow path / LRU
+
+`cold_code_core_acquire_slot_v2(image_id, slot)`：
+
+1. `cpu = cold_code_cpu_id()`；取 `g_managers[cpu]`。
+2. 无 manager/未 READY → 无 context 可调用，直接 trap。
+3. 校验 image_id 和 slot。
+4. 命中：更新 tick/way_used/hits，返回 pool slot。
+5. 未命中：找 free way，否则扫描最老 way 驱逐；更新 slot_map/way_slot、trace。
+6. 通过 loader 读取 `payload_offset + slot*slot_size` 到 pool。
+7. 调用 context `sync_code`（若有）。
+8. 标记 resident、更新 tick、loads、trace，返回地址。
+
+所有调用都是 slow stub；没有单独的 fast accessor。
+
+## 8. Fault
+
+- 有 manager：先调用 manager fault callback（若配置），再调用
+  `manager->context->fatal`。
+- 无 manager（例如 init 前直接调用冷函数）：core 直接 `__builtin_trap()`。
+- `fatal` 返回时 core 进入不可返回循环；port 不得返回。
+- fault code 包括 `NO_CURRENT`、`WRONG_IMAGE`、`BAD_SLOT`、`CORRUPT_STATE`、
+  `SOURCE_READ`、`NO_VICTIM`。
+
+## 9. Image v4 / identity
+
+- 64 字节小端 wire header，version 4、ABI 2、`storage_align` offset 52、
+  reserved 56/60 必须 0、header CRC。
+- `image_id` 是 build fingerprint：domain + name + arch + slot_size + slot_count +
+  max_pool_slots + storage_align + padded payload 的 CRC32。
+- stub 内嵌 image_id；slow acquire 比较 manager 的 image_id，错配 fault
+  `WRONG_IMAGE`。
+- v5 只生成 slow stub；image `.bin` 可复用，FAST stub 必须重新生成。
+
+## 10. 并发 / 多 port
+
+- 一个 CPU 一个 manager；不同 CPU 的冷调用可并发。
+- 无锁、无 pin；同一 manager 不跨 CPU 共享。
+- loader 共享时可重入；context fatal/sync 应可重入。
+- host + baremetal + custom 可同时链接；每个 manager 的 config.context 选择 ops。
+- host port 单线程；多 CPU host 测试通过强 `cold_code_cpu_id()` 顺序切换。
+- baremetal 多核并发依赖正确 CPU id 和跨 CPU 发布同步。
